@@ -1,4 +1,4 @@
-FROM pytorch/pytorch:1.7.0-cuda11.0-cudnn8-runtime
+FROM pytorch/pytorch:1.6.0-cuda10.1-cudnn7-runtime
 
 
 ENV LANG=C.UTF-8 LC_ALL=C.UTF-8
@@ -54,6 +54,10 @@ RUN pipdeptree
 
 # RUN mkdir data
 # COPY data/*.jsonl data/
+
+COPY config.yaml .
 COPY app.py ./
+RUN mkdir -p outputs/data
+RUN mkdir -p outputs/models
 
 CMD ["python3", "app.py"]

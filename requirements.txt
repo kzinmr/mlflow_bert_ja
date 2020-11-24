@@ -4,5 +4,6 @@ pytorch_lightning==1.0.7
 transformers==3.5.1
 sentencepiece==0.1.91
 torchtext==0.8.0
+omegaconf==2.0.5
 gorilla
 pipdeptree
