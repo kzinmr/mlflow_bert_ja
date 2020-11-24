@@ -61,3 +61,4 @@ COPY app.py ./
 # RUN mkdir -p outputs/models
 
 CMD ["python3", "app.py"]
+# , "--gpus", "1"]
