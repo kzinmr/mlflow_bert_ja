@@ -34,10 +34,10 @@ RUN apt-get update \
     mecab \
     libmecab-dev \
     #   mecab-ipadic-utf8 \
-    python3.8 \
-    python3.8-dev \
+    # python3.8 \
+    # python3.8-dev \
+    # python3.8-venv \
     python3-pip \
-    python3.8-venv \
     openjdk-11-jre-headless \
     && curl -sL https://deb.nodesource.com/setup_10.x | bash - \
     && apt-get update && apt-get install -y nodejs \
@@ -55,9 +55,9 @@ RUN pipdeptree
 # RUN mkdir data
 # COPY data/*.jsonl data/
 
-COPY config.yaml .
 COPY app.py ./
-RUN mkdir -p outputs/data
-RUN mkdir -p outputs/models
+# COPY config.yaml .
+# RUN mkdir -p outputs/data
+# RUN mkdir -p outputs/models
 
 CMD ["python3", "app.py"]
