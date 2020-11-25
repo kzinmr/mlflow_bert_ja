@@ -55,7 +55,8 @@ RUN pipdeptree
 # RUN mkdir data
 # COPY data/*.jsonl data/
 
-COPY app.py ./
+COPY *.py ./
+COPY *.sh ./
 # COPY config.yaml .
 # RUN mkdir -p outputs/data
 # RUN mkdir -p outputs/models
