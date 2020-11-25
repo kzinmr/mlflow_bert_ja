@@ -6,4 +6,5 @@ sentencepiece==0.1.91
 torchtext==0.7.0
 omegaconf==2.0.5
 gorilla
+seqeval
 pipdeptree
