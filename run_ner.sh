@@ -7,12 +7,13 @@ export NUM_EPOCHS=3
 export SEED=1
 export OUTPUT_DIR_NAME=germeval-model
 export OUTPUT_DIR=${PWD}/${OUTPUT_DIR_NAME}
+export LABEL_PATH=$DATA_DIR/labels.txt
 mkdir -p $OUTPUT_DIR
 
 python3 download_ner_data.py $DATA_DIR $BERT_MODEL $MAX_LENGTH
 
 python3 ner.py --gpus 1 --data_dir $DATA_DIR \
---labels ./labels.txt \
+--labels $LABEL_PATH \
 --model_name_or_path $BERT_MODEL \
 --output_dir $OUTPUT_DIR \
 --max_seq_length  $MAX_LENGTH \
