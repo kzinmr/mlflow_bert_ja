@@ -9,7 +9,7 @@ export OUTPUT_DIR_NAME=germeval-model
 export OUTPUT_DIR=${PWD}/${OUTPUT_DIR_NAME}
 mkdir -p $OUTPUT_DIR
 
-python3 download_ner_data.py ./ $BERT_MODEL $MAX_LENGTH
+python3 download_ner_data.py $DATA_DIR $BERT_MODEL $MAX_LENGTH
 
 python3 ner.py --gpus 1 --data_dir $DATA_DIR \
 --labels ./labels.txt \
