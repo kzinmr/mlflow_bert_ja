@@ -25,6 +25,22 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class InputExample:
+    """
+    A single training/test example for token classification.
+    Args:
+        guid: Unique id for the example.
+        words: list. The words of the sequence.
+        labels: (Optional) list. The labels for each word of the sequence. This should be
+        specified for train and dev examples, but not for test examples.
+    """
+
+    guid: str
+    words: List[str]
+    labels: Optional[List[str]]
+
+
+@dataclass
 class InputFeatures:
     """
     A single set of features of data.
