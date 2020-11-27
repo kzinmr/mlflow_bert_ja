@@ -16,8 +16,35 @@ from sklearn.model_selection import train_test_split
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from transformers import BertModel, BertTokenizer, AdamW
-from torchtext.utils import download_from_url, extract_archive
-from torchtext.datasets.text_classification import URLS
+from pathlib import Path
+
+
+def make_livedoor_corpus_dataset(data_dir: str = "./data") -> pd.DataFrame:
+    # TODO: add livedoor corpus downloader
+    # ライブドアコーパスを[カテゴリ, 本文]形式でpd.DataFrameで読み込む
+    parent_dir = Path(data_dir)
+    categories = [
+        "sports-watch",
+        "topic-news",
+        "dokujo-tsushin",
+        "peachy",
+        "movie-enter",
+        "kaden-channel",
+        "livedoor-homme",
+        "smax",
+        "it-life-hack",
+    ]
+    docs = []
+    for category in categories:
+        for p in (parent_dir / f"{category}").glob(f"{category}*.txt"):
+            with open(p, "r") as f:
+                next(f)  # url
+                next(f)  # date
+                next(f)  # title
+                body = "\n".join([line.strip() for line in f if line.strip()])
+            docs.append((category, body))
+
+    return pd.DataFrame(docs, columns=["label", "text"])
 
 
 class DocCatDataset(Dataset):
@@ -75,6 +102,7 @@ class BertJapaneseDataModule(pl.LightningDataModule):
         Initialization of inherited lightning data module
         """
         super(BertJapaneseDataModule, self).__init__()
+        # TODO: Fix this cl-tohoku or smt else
         self.PRE_TRAINED_MODEL_NAME = "bert-base-uncased"
         self.df_train = None
         self.df_val = None
@@ -87,12 +115,6 @@ class BertJapaneseDataModule(pl.LightningDataModule):
         self.tokenizer = None
         self.args = kwargs
 
-    def to_label(self, rating):
-        """
-        Returns the rating minus one to make it for zero position start
-        """
-        rating = int(rating)
-        return rating - 1
 
     def prepare_data(self):
         """
@@ -112,14 +134,15 @@ class BertJapaneseDataModule(pl.LightningDataModule):
         # for fname in extracted_files:
         #     if fname.endswith("train.csv"):
         #         train_csv_path = fname
-        train_csv_path = 'stab.csv'
-        df = pd.read_csv(train_csv_path)
+        p = Path('./data')
+        p.mkdir(exist_ok=True)
+        df = make_livedoor_corpus_dataset(p)
 
-        df.columns = ["label", "title", "description"]
+        df.columns = ["label", "text"]
         df.sample(frac=1)
         df = df.iloc[: self.args["num_samples"]]
-
-        df["label"] = df.label.apply(self.to_label)
+        to_label = {k: v for v, k in enumerate(sorted(set(df.label.to_numpy().to_list())))}
+        df["label"] = df.label.apply(lambda x: to_label[x])
 
         self.tokenizer = BertTokenizer.from_pretrained(self.PRE_TRAINED_MODEL_NAME)
 
