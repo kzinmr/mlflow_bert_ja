@@ -105,15 +105,14 @@ class BertJapaneseDataModule(pl.LightningDataModule):
         :param stage: Stage - training or testing
         """
         # TODO: Make this Livedoor corpus
-        # reading  the input
-        dataset_tar = download_from_url(URLS["AG_NEWS"], root=".data")
-        extracted_files = extract_archive(dataset_tar)
-
-        train_csv_path = None
-        for fname in extracted_files:
-            if fname.endswith("train.csv"):
-                train_csv_path = fname
-
+        # first, remove torchtext dependency
+        # dataset_tar = download_from_url(URLS["AG_NEWS"], root=".data")
+        # extracted_files = extract_archive(dataset_tar)
+        # train_csv_path = None
+        # for fname in extracted_files:
+        #     if fname.endswith("train.csv"):
+        #         train_csv_path = fname
+        train_csv_path = 'stab.csv'
         df = pd.read_csv(train_csv_path)
 
         df.columns = ["label", "title", "description"]
