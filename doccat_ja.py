@@ -151,28 +151,35 @@ class BertJapaneseDataModule(pl.LightningDataModule):
         self.encoding = None
         self.tokenizer = None
         self.args = kwargs
+        self.df_org = None
+        self.df_use = None
+        self.label2id = None
 
     def prepare_data(self):
         """
-        Implementation of abstract class
+        Downloads the data and prepare the tokenizer
         """
+        self.tokenizer = BertTokenizer.from_pretrained(self.PRE_TRAINED_MODEL_NAME)
+        df = make_livedoor_corpus_dataset()
+        self.df_org = df
+        df = self.df_all
+        df.sample(frac=1)
+        df = df.iloc[: self.args["num_samples"]]
+        # label2id =  {k: v for v, k in enumerate(LABELS)}
+        label2id = {
+            k: v for v, k in enumerate(sorted(set(df.label.to_numpy().to_list())))
+        }
+        df[LABEL_COL_NAME] = df[LABEL_COL_NAME].apply(lambda x: label2id[x])
+        self.label2id = label2id
+        self.df_use = df
 
     def setup(self, stage=None):
         """
-        Downloads the data, parse it and split the data into train, test, validation data
+        split the data into train, test, validation data
         :param stage: Stage - training or testing
         """
 
-        self.tokenizer = BertTokenizer.from_pretrained(self.PRE_TRAINED_MODEL_NAME)
-
-        df = make_livedoor_corpus_dataset()
-
-        df.columns = [LABEL_COL_NAME, TEXT_COL_NAME]
-        df.sample(frac=1)
-        df = df.iloc[: self.args["num_samples"]]
-        to_label = {k: v for v, k in enumerate(LABELS)}
-
-        df[LABEL_COL_NAME] = df[LABEL_COL_NAME].apply(lambda x: to_label[x])
+        df = self.df_use
 
         # NOTE: (fixed) np.random random_state is used by default
         df_train, df_test = train_test_split(
@@ -210,7 +217,7 @@ class BertJapaneseDataModule(pl.LightningDataModule):
         )
         return parser
 
-    def create_data_loader(self, df, tokenizer, max_len, batch_size):
+    def create_data_loader(self, df, tokenizer, max_len, batch_size, num_workers):
         """
         Generic data loader function
         :param df: Input dataframe
@@ -229,7 +236,9 @@ class BertJapaneseDataModule(pl.LightningDataModule):
         )
 
         return DataLoader(
-            ds, batch_size=self.args["batch_size"], num_workers=self.args["num_workers"]
+            ds,
+            batch_size=batch_size,
+            num_workers=num_workers,
         )
 
     def train_dataloader(self):
@@ -237,7 +246,11 @@ class BertJapaneseDataModule(pl.LightningDataModule):
         :return: output - Train data loader for the given input
         """
         self.train_data_loader = self.create_data_loader(
-            self.df_train, self.tokenizer, self.MAX_LEN, self.args["batch_size"]
+            self.df_train,
+            self.tokenizer,
+            self.MAX_LEN,
+            self.args["batch_size"],
+            self.args["num_workers"],
         )
         return self.train_data_loader
 
@@ -246,7 +259,11 @@ class BertJapaneseDataModule(pl.LightningDataModule):
         :return: output - Validation data loader for the given input
         """
         self.val_data_loader = self.create_data_loader(
-            self.df_val, self.tokenizer, self.MAX_LEN, self.args["batch_size"]
+            self.df_val,
+            self.tokenizer,
+            self.MAX_LEN,
+            self.args["batch_size"],
+            self.args["num_workers"],
         )
         return self.val_data_loader
 
@@ -255,7 +272,11 @@ class BertJapaneseDataModule(pl.LightningDataModule):
         :return: output - Test data loader for the given input
         """
         self.test_data_loader = self.create_data_loader(
-            self.df_test, self.tokenizer, self.MAX_LEN, self.args["batch_size"]
+            self.df_test,
+            self.tokenizer,
+            self.MAX_LEN,
+            self.args["batch_size"],
+            self.args["num_workers"],
         )
         return self.test_data_loader
 
