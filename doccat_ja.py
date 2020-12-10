@@ -16,27 +16,65 @@ from sklearn.model_selection import train_test_split
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from transformers import BertModel, BertTokenizer, AdamW
+from typing import Final, Optional
 from pathlib import Path
+import requests
+import tarfile
+
+TEXT_COL_NAME: Final[str] = "text"
+LABEL_COL_NAME: Final[str] = "label"
+INPUT_IDS: Final[str] = "input_ids"
+ATTENTION_MASK: Final[str] = "attention_mask"
+
+PRE_TRAINED_MODEL_NAME: Final[str] = "cl-tohoku/bert-base-japanese"
+LABELS: Final[Tuple] = (
+    "sports-watch",
+    "topic-news",
+    "dokujo-tsushin",
+    "peachy",
+    "movie-enter",
+    "kaden-channel",
+    "livedoor-homme",
+    "smax",
+    "it-life-hack",
+)
+# fix seed
+RANDOM_SEED: Final[int] = 42
+random.seed(seed)
+os.environ["PYTHONHASHSEED"] = str(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+
+
+def prepare_livedoor_corpus(data_dir: Path) -> Optional[Path]:
+    """livedoorコーパスデータのダウンロード"""
+    filepath = Path("ldcc.tar")
+    url = "https://www.rondhuit.com/download/ldcc-20140209.tar.gz"
+    response = requests.get(url)
+    if response.ok:
+        with open(filepath, "wb") as fp:
+            fp.write(response.content)
+        with tarfile.open(filepath, "r") as fp:
+            fp.extractall(data_dir)
+        filepath.unlink()
+        return data_dir / "text"
+    return None
 
 
 def make_livedoor_corpus_dataset(data_dir: str = "./data") -> pd.DataFrame:
     # TODO: add livedoor corpus downloader
     # ライブドアコーパスを[カテゴリ, 本文]形式でpd.DataFrameで読み込む
-    parent_dir = Path(data_dir)
-    categories = [
-        "sports-watch",
-        "topic-news",
-        "dokujo-tsushin",
-        "peachy",
-        "movie-enter",
-        "kaden-channel",
-        "livedoor-homme",
-        "smax",
-        "it-life-hack",
-    ]
+    pdir = Path(data_dir)
+    if not (pdir / "text").exists():
+        pdir.mkdir(exist_ok=True)
+        parent_path = prepare_livedoor_corpus(Path(data_dir))
+    else:
+        parent_path = pdir / "text"
+
+    categories = LABELS
     docs = []
     for category in categories:
-        for p in (parent_dir / f"{category}").glob(f"{category}*.txt"):
+        for p in (parent_path / f"{category}").glob(f"{category}*.txt"):
             with open(p, "r") as f:
                 next(f)  # url
                 next(f)  # date
@@ -44,7 +82,7 @@ def make_livedoor_corpus_dataset(data_dir: str = "./data") -> pd.DataFrame:
                 body = "\n".join([line.strip() for line in f if line.strip()])
             docs.append((category, body))
 
-    return pd.DataFrame(docs, columns=["label", "text"])
+    return pd.DataFrame(docs, columns=[LABEL_COL_NAME, TEXT_COL_NAME])
 
 
 class DocCatDataset(Dataset):
@@ -89,10 +127,10 @@ class DocCatDataset(Dataset):
         )
 
         return {
-            "text": text,
-            "input_ids": encoding["input_ids"].flatten(),
-            "attention_mask": encoding["attention_mask"].flatten(),
-            "labels": torch.tensor(label, dtype=torch.long),
+            TEXT_COL_NAME: text,
+            INPUT_IDS: encoding[INPUT_IDS].flatten(),
+            ATTENTION_MASK: encoding[ATTENTION_MASK].flatten(),
+            LABEL_COL_NAME: torch.tensor(label, dtype=torch.long),
         }
 
 
@@ -102,19 +140,17 @@ class BertJapaneseDataModule(pl.LightningDataModule):
         Initialization of inherited lightning data module
         """
         super(BertJapaneseDataModule, self).__init__()
-        # TODO: Fix this cl-tohoku or smt else
-        self.PRE_TRAINED_MODEL_NAME = "bert-base-uncased"
+        self.PRE_TRAINED_MODEL_NAME = PRE_TRAINED_MODEL_NAME
         self.df_train = None
         self.df_val = None
         self.df_test = None
         self.train_data_loader = None
         self.val_data_loader = None
         self.test_data_loader = None
-        self.MAX_LEN = 100
+        self.MAX_LEN = 512
         self.encoding = None
         self.tokenizer = None
         self.args = kwargs
-
 
     def prepare_data(self):
         """
@@ -126,35 +162,24 @@ class BertJapaneseDataModule(pl.LightningDataModule):
         Downloads the data, parse it and split the data into train, test, validation data
         :param stage: Stage - training or testing
         """
-        # TODO: Make this Livedoor corpus
-        # first, remove torchtext dependency
-        # dataset_tar = download_from_url(URLS["AG_NEWS"], root=".data")
-        # extracted_files = extract_archive(dataset_tar)
-        # train_csv_path = None
-        # for fname in extracted_files:
-        #     if fname.endswith("train.csv"):
-        #         train_csv_path = fname
-        p = Path('./data')
-        p.mkdir(exist_ok=True)
-        df = make_livedoor_corpus_dataset(p)
-
-        df.columns = ["label", "text"]
-        df.sample(frac=1)
-        df = df.iloc[: self.args["num_samples"]]
-        to_label = {k: v for v, k in enumerate(sorted(set(df.label.to_numpy().to_list())))}
-        df["label"] = df.label.apply(lambda x: to_label[x])
 
         self.tokenizer = BertTokenizer.from_pretrained(self.PRE_TRAINED_MODEL_NAME)
 
-        RANDOM_SEED = 42
-        np.random.seed(RANDOM_SEED)
-        torch.manual_seed(RANDOM_SEED)
+        df = make_livedoor_corpus_dataset()
 
+        df.columns = [LABEL_COL_NAME, TEXT_COL_NAME]
+        df.sample(frac=1)
+        df = df.iloc[: self.args["num_samples"]]
+        to_label = {k: v for v, k in enumerate(LABELS)}
+
+        df[LABEL_COL_NAME] = df[LABEL_COL_NAME].apply(lambda x: to_label[x])
+
+        # NOTE: (fixed) np.random random_state is used by default
         df_train, df_test = train_test_split(
-            df, test_size=0.3, random_state=RANDOM_SEED, stratify=df["label"]
+            df, test_size=0.3, stratify=df[LABEL_COL_NAME]
         )
         df_val, df_test = train_test_split(
-            df_test, test_size=0.5, random_state=RANDOM_SEED, stratify=df_test["label"]
+            df_test, test_size=0.5, stratify=df_test[LABEL_COL_NAME]
         )
 
         self.df_train = df_train
@@ -194,8 +219,8 @@ class BertJapaneseDataModule(pl.LightningDataModule):
         :param batch_size: Batch size for training
         :return: Returns the constructed dataloader
         """
-        texts = df.text.to_numpy()
-        labels = df.label.to_numpy()
+        texts = df[TEXT_COL_NAME].to_numpy()
+        labels = df[LABEL_COL_NAME].to_numpy()
         ds = DocCatDataset(
             texts=texts,
             labels=labels,
@@ -241,13 +266,13 @@ class BertNewsClassifier(pl.LightningModule):
         Initializes the network, optimizer and scheduler
         """
         super(BertNewsClassifier, self).__init__()
-        self.PRE_TRAINED_MODEL_NAME = "bert-base-uncased"
+        self.PRE_TRAINED_MODEL_NAME = PRE_TRAINED_MODEL_NAME
         self.bert_model = BertModel.from_pretrained(self.PRE_TRAINED_MODEL_NAME)
         for param in self.bert_model.parameters():
             param.requires_grad = False
         self.drop = nn.Dropout(p=0.2)
         # assigning labels
-        self.class_names = ["world", "Sports", "Business", "Sci/Tech"]
+        self.class_names = LABELS
         n_classes = len(self.class_names)
 
         self.fc1 = nn.Linear(self.bert_model.config.hidden_size, 512)
@@ -295,9 +320,9 @@ class BertNewsClassifier(pl.LightningModule):
         :param batch_idx: Batch indices
         :return: output - Training loss
         """
-        input_ids = train_batch["input_ids"].to(self.device)
-        attention_mask = train_batch["attention_mask"].to(self.device)
-        labels = train_batch["labels"].to(self.device)
+        input_ids = train_batch[INPUT_IDS].to(self.device)
+        attention_mask = train_batch[ATTENTION_MASK].to(self.device)
+        labels = train_batch[LABEL_COL_NAME].to(self.device)
         output = self.forward(input_ids, attention_mask)
         loss = F.cross_entropy(output, labels)
         self.log("train_loss", loss)
@@ -310,9 +335,9 @@ class BertNewsClassifier(pl.LightningModule):
         :param batch_idx: Batch indices
         :return: output - Testing accuracy
         """
-        input_ids = test_batch["input_ids"].to(self.device)
-        attention_mask = test_batch["attention_mask"].to(self.device)
-        labels = test_batch["labels"].to(self.device)
+        input_ids = test_batch[INPUT_IDS].to(self.device)
+        attention_mask = test_batch[ATTENTION_MASK].to(self.device)
+        labels = test_batch[LABEL_COL_NAME].to(self.device)
         output = self.forward(input_ids, attention_mask)
         _, y_hat = torch.max(output, dim=1)
         test_acc = accuracy_score(y_hat.cpu(), labels.cpu())
@@ -326,9 +351,9 @@ class BertNewsClassifier(pl.LightningModule):
         :return: output - valid step loss
         """
 
-        input_ids = val_batch["input_ids"].to(self.device)
-        attention_mask = val_batch["attention_mask"].to(self.device)
-        labels = val_batch["labels"].to(self.device)
+        input_ids = val_batch[INPUT_IDS].to(self.device)
+        attention_mask = val_batch[ATTENTION_MASK].to(self.device)
+        labels = val_batch[LABEL_COL_NAME].to(self.device)
         output = self.forward(input_ids, attention_mask)
         loss = F.cross_entropy(output, labels)
         return {"val_step_loss": loss}
@@ -408,7 +433,7 @@ def make_model_and_dm(argparse_args):
 
 
 if __name__ == "__main__":
-    parser = ArgumentParser(description="Japanese Bert-News Classifier Example")
+    parser = ArgumentParser(description="Japanese Bert News Classifier Example")
 
     parser.add_argument(
         "--num_samples",
@@ -426,7 +451,6 @@ if __name__ == "__main__":
     mlflow.pytorch.autolog()
 
     args = parser.parse_args()
-
     model, dm = make_model_and_dm(args)
     trainer = make_trainer(args)
 
