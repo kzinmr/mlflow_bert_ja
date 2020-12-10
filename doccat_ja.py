@@ -1,4 +1,5 @@
 import os
+import random
 from argparse import ArgumentParser
 import mlflow.pytorch
 import numpy as np
@@ -16,7 +17,7 @@ from sklearn.model_selection import train_test_split
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from transformers import BertModel, BertTokenizer, AdamW
-from typing import Final, Optional
+from typing import Final, Optional, Tuple
 from pathlib import Path
 import requests
 import tarfile
@@ -40,10 +41,10 @@ LABELS: Final[Tuple] = (
 )
 # fix seed
 RANDOM_SEED: Final[int] = 42
-random.seed(seed)
-os.environ["PYTHONHASHSEED"] = str(seed)
-np.random.seed(seed)
-torch.manual_seed(seed)
+random.seed(RANDOM_SEED)
+os.environ["PYTHONHASHSEED"] = str(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+torch.manual_seed(RANDOM_SEED)
 
 
 def prepare_livedoor_corpus(data_dir: Path) -> Optional[Path]:
