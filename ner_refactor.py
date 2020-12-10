@@ -2,15 +2,20 @@ import argparse
 import glob
 import logging
 import os
-from argparse import Namespace
+from argparse import ArgumentParser, Namespace
+from pathlib import Path
+from typing import Any, Dict
 
 import numpy as np
 import torch
 from seqeval.metrics import accuracy_score, f1_score, precision_score, recall_score
 from torch.nn import CrossEntropyLoss
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Dataset, TensorDataset
 
-from lightning_base import BaseTransformer, add_generic_args, generic_train
+import pytorch_lightning as pl
+from pytorch_lightning.utilities import rank_zero_info
+
+from lightning_base import add_generic_args
 
 from dataclasses import dataclass
 from enum import Enum
@@ -24,6 +29,7 @@ from transformers import (
     PreTrainedModel,
     PreTrainedTokenizer,
 )
+from transformers.optimization import Adafactor
 from transformers.modeling_outputs import TokenClassifierOutput
 
 logger = logging.getLogger(__name__)
@@ -204,112 +210,115 @@ class TokenClassificationDataModule(pl.LightningDataModule):
 
         label_map = {label: i for i, label in enumerate(label_list)}
 
-        features: List[InputFatures] = []
+        features: List[InputFeatures] = []
         for (ex_index, example) in enumerate(examples):
             if ex_index % 10_000 == 0:
                 logger.info("Writing example %d of %d", ex_index, len(examples))
 
             tokens = []
             label_ids = []
-            for word, label in zip(example.words, example.labels):
-                word_tokens = tokenizer.tokenize(word)
+            if example.labels is not None:
+                for word, label in zip(example.words, example.labels):
+                    word_tokens = tokenizer.tokenize(word)
 
-                # bert-base-multilingual-cased sometimes output "nothing ([]) when calling tokenize with just a space.
-                if len(word_tokens) > 0:
-                    tokens.extend(word_tokens)
-                    # Use the real label id for the first token of the word, and padding ids for the remaining tokens
-                    label_ids.extend(
-                        [label_map[label]]   # * len(word_tokens)
-                        + [pad_token_label_id] * (len(word_tokens) - 1)
-                    )
+                    # bert-base-multilingual-cased sometimes output "nothing ([]) when calling tokenize with just a space.
+                    if len(word_tokens) > 0:
+                        tokens.extend(word_tokens)
+                        # Use the real label id for the first token of the word, and padding ids for the remaining tokens
+                        label_ids.extend(
+                            [label_map[label]]   # * len(word_tokens)
+                            + [pad_token_label_id] * (len(word_tokens) - 1)
+                        )
 
-            # Account for [CLS] and [SEP] with "- 2" and with "- 3" for RoBERTa.
-            special_tokens_count = tokenizer.num_special_tokens_to_add()
-            if len(tokens) > max_seq_length - special_tokens_count:
-                tokens = tokens[: (max_seq_length - special_tokens_count)]
-                label_ids = label_ids[: (max_seq_length - special_tokens_count)]
+                # Account for [CLS] and [SEP] with "- 2" and with "- 3" for RoBERTa.
+                special_tokens_count = tokenizer.num_special_tokens_to_add()
+                if len(tokens) > max_seq_length - special_tokens_count:
+                    tokens = tokens[: (max_seq_length - special_tokens_count)]
+                    label_ids = label_ids[: (max_seq_length - special_tokens_count)]
 
-            # The convention in BERT is:
-            # (a) For sequence pairs:
-            #  tokens:   [CLS] is this jack ##son ##ville ? [SEP] no it is not . [SEP]
-            #  type_ids:   0   0  0    0    0     0       0   0   1  1  1  1   1   1
-            # (b) For single sequences:
-            #  tokens:   [CLS] the dog is hairy . [SEP]
-            #  type_ids:   0   0   0   0  0     0   0
-            #
-            # Where "type_ids" are used to indicate whether this is the first
-            # sequence or the second sequence. The embedding vectors for `type=0` and
-            # `type=1` were learned during pre-training and are added to the wordpiece
-            # embedding vector (and position vector). This is not *strictly* necessary
-            # since the [SEP] token unambiguously separates the sequences, but it makes
-            # it easier for the model to learn the concept of sequences.
-            #
-            # For classification tasks, the first vector (corresponding to [CLS]) is
-            # used as as the "sentence vector". Note that this only makes sense because
-            # the entire model is fine-tuned.
-            tokens += [sep_token]
-            label_ids += [pad_token_label_id]
-            if sep_token_extra:
-                # roberta uses an extra separator b/w pairs of sentences
+                # The convention in BERT is:
+                # (a) For sequence pairs:
+                #  tokens:   [CLS] is this jack ##son ##ville ? [SEP] no it is not . [SEP]
+                #  type_ids:   0   0  0    0    0     0       0   0   1  1  1  1   1   1
+                # (b) For single sequences:
+                #  tokens:   [CLS] the dog is hairy . [SEP]
+                #  type_ids:   0   0   0   0  0     0   0
+                #
+                # Where "type_ids" are used to indicate whether this is the first
+                # sequence or the second sequence. The embedding vectors for `type=0` and
+                # `type=1` were learned during pre-training and are added to the wordpiece
+                # embedding vector (and position vector). This is not *strictly* necessary
+                # since the [SEP] token unambiguously separates the sequences, but it makes
+                # it easier for the model to learn the concept of sequences.
+                #
+                # For classification tasks, the first vector (corresponding to [CLS]) is
+                # used as as the "sentence vector". Note that this only makes sense because
+                # the entire model is fine-tuned.
                 tokens += [sep_token]
                 label_ids += [pad_token_label_id]
-            segment_ids = [sequence_a_segment_id] * len(tokens)
+                if sep_token_extra:
+                    # roberta uses an extra separator b/w pairs of sentences
+                    tokens += [sep_token]
+                    label_ids += [pad_token_label_id]
+                segment_ids = [sequence_a_segment_id] * len(tokens)
 
-            if cls_token_at_end:
-                tokens += [cls_token]
-                label_ids += [pad_token_label_id]
-                segment_ids += [cls_token_segment_id]
-            else:
-                tokens = [cls_token] + tokens
-                label_ids = [pad_token_label_id] + label_ids
-                segment_ids = [cls_token_segment_id] + segment_ids
+                if cls_token_at_end:
+                    tokens += [cls_token]
+                    label_ids += [pad_token_label_id]
+                    segment_ids += [cls_token_segment_id]
+                else:
+                    tokens = [cls_token] + tokens
+                    label_ids = [pad_token_label_id] + label_ids
+                    segment_ids = [cls_token_segment_id] + segment_ids
 
-            input_ids = tokenizer.convert_tokens_to_ids(tokens)
+                input_ids: List[int] = tokenizer.convert_tokens_to_ids(tokens)
 
-            # The mask has 1 for real tokens and 0 for padding tokens. Only real
-            # tokens are attended to.
-            input_mask = [1 if mask_padding_with_zero else 0] * len(input_ids)
+                # The mask has 1 for real tokens and 0 for padding tokens. Only real
+                # tokens are attended to.
+                input_mask = [1 if mask_padding_with_zero else 0] * len(input_ids)
 
-            # Zero-pad up to the sequence length.
-            padding_length = max_seq_length - len(input_ids)
-            if pad_on_left:
-                input_ids = ([pad_token] * padding_length) + input_ids
-                input_mask = (
-                    [0 if mask_padding_with_zero else 1] * padding_length
-                ) + input_mask
-                segment_ids = ([pad_token_segment_id] * padding_length) + segment_ids
-                label_ids = ([pad_token_label_id] * padding_length) + label_ids
-            else:
-                input_ids += [pad_token] * padding_length
-                input_mask += [0 if mask_padding_with_zero else 1] * padding_length
-                segment_ids += [pad_token_segment_id] * padding_length
-                label_ids += [pad_token_label_id] * padding_length
+                # Zero-pad up to the sequence length.
+                padding_length = max_seq_length - len(input_ids)
+                if pad_on_left:
+                    input_ids = ([pad_token] * padding_length) + input_ids
+                    input_mask = (
+                        [0 if mask_padding_with_zero else 1] * padding_length
+                    ) + input_mask
+                    segment_ids = [pad_token_segment_id] * padding_length + segment_ids
+                    label_ids = ([pad_token_label_id] * padding_length) + label_ids
+                else:
+                    input_ids += [pad_token] * padding_length
+                    input_mask += [0 if mask_padding_with_zero else 1] * padding_length
+                    segment_ids += [pad_token_segment_id] * padding_length
+                    label_ids += [pad_token_label_id] * padding_length
 
-            assert len(input_ids) == max_seq_length
-            assert len(input_mask) == max_seq_length
-            assert len(segment_ids) == max_seq_length
-            assert len(label_ids) == max_seq_length
+                assert len(input_ids) == max_seq_length
+                assert len(input_mask) == max_seq_length
+                assert len(segment_ids) == max_seq_length
+                assert len(label_ids) == max_seq_length
 
-            if ex_index < 5:
-                logger.info("*** Example ***")
-                logger.info("guid: %s", example.guid)
-                logger.info("tokens: %s", " ".join([str(x) for x in tokens]))
-                logger.info("input_ids: %s", " ".join([str(x) for x in input_ids]))
-                logger.info("input_mask: %s", " ".join([str(x) for x in input_mask]))
-                logger.info("segment_ids: %s", " ".join([str(x) for x in segment_ids]))
-                logger.info("label_ids: %s", " ".join([str(x) for x in label_ids]))
+                if ex_index < 5:
+                    logger.info("*** Example ***")
+                    logger.info("guid: %s", example.guid)
+                    logger.info("tokens: %s", " ".join([str(x) for x in tokens]))
+                    logger.info("input_ids: %s", " ".join([str(x) for x in input_ids]))
+                    logger.info("input_mask: %s", " ".join([str(x) for x in input_mask]))
+                    logger.info("segment_ids: %s", " ".join([str(x) for x in segment_ids]))
+                    logger.info("label_ids: %s", " ".join([str(x) for x in label_ids]))
 
-            if "token_type_ids" not in tokenizer.model_input_names:
-                segment_ids = None
+                if "token_type_ids" not in tokenizer.model_input_names:
+                    segment_ids = None
 
-            features.append(
-                InputFeatures(
-                    input_ids=input_ids,
-                    attention_mask=input_mask,
-                    token_type_ids=segment_ids,
-                    label_ids=label_ids,
+                text = ''.join(tokens)
+                features.append(
+                    InputFeatures(
+                        text=text,
+                        input_ids=input_ids,
+                        attention_mask=input_mask,
+                        token_type_ids=segment_ids,
+                        label_ids=label_ids,
+                    )
                 )
-            )
         return features
 
 
@@ -565,7 +574,7 @@ class TokenClassificationDataModule(pl.LightningDataModule):
 
 
 
-class TokenClassification(pl.LightningModule):
+class TokenClassificationModule(pl.LightningModule):
 
     def __init__(self, hparams):
         """Initialize a model and config for token-classification"""
@@ -578,7 +587,7 @@ class TokenClassification(pl.LightningModule):
         self.scheduler = None
         self.optimizer = None
 
-        super(TokenClassification, self).__init__()
+        super().__init__()
 
         # TODO: move to self.save_hyperparameters()
         # self.save_hyperparameters()
@@ -642,8 +651,8 @@ class TokenClassification(pl.LightningModule):
         inputs = {
             "input_ids": train_batch.input_ids,
             "attention_mask": train_batch.attention_mask,
-            "token_type_ids": train_batch.token_type_ids if self.config.model_type in ["bert", "xlnet"] else None
-            "labels": train_batch.labels
+            "token_type_ids": train_batch.token_type_ids if self.config.model_type in ["bert", "xlnet"] else None,
+            "labels": train_batch.label_ids
         }
         outputs: TokenClassifierOutput = self(**inputs)
         loss = outputs[0]
@@ -663,8 +672,8 @@ class TokenClassification(pl.LightningModule):
         inputs = {
             "input_ids": val_batch.input_ids,
             "attention_mask": val_batch.attention_mask,
-            "token_type_ids": val_batch.token_type_ids if self.config.model_type in ["bert", "xlnet"] else None
-            "labels": val_batch.labels
+            "token_type_ids": val_batch.token_type_ids if self.config.model_type in ["bert", "xlnet"] else None,
+            "labels": val_batch.label_ids
         }
         outputs: TokenClassifierOutput = self(**inputs)
         loss, logits = outputs[:2]
@@ -715,7 +724,9 @@ class TokenClassification(pl.LightningModule):
         ret, _, _ = self._eval_end(outputs)
         # pytorch_lightning/trainer/logging.py#L139
         logs = ret["log"]
-        return {"val_loss": logs["val_loss"], "log": logs, "progress_bar": logs, sync_dist=True}
+        avg_loss = logs["val_loss"]
+        self.log("val_loss", avg_loss, sync_dist=True)
+        return {"val_loss": avg_loss, "log": logs, "progress_bar": logs, sync_dist=True}
 
     def test_epoch_end(self, outputs):
         """
@@ -850,14 +861,6 @@ class TokenClassification(pl.LightningModule):
             help="The initial learning rate for Adam.",
         )
         parser.add_argument(
-            "--lr_scheduler",
-            default="linear",
-            choices=arg_to_scheduler_choices,
-            metavar=arg_to_scheduler_metavar,
-            type=str,
-            help="Learning rate scheduler",
-        )
-        parser.add_argument(
             "--weight_decay",
             default=0.0,
             type=float,
@@ -893,10 +896,149 @@ class TokenClassification(pl.LightningModule):
         return parser
 
 
+class LoggingCallback(pl.Callback):
+    def on_batch_end(self, trainer, pl_module):
+        lr_scheduler = trainer.lr_schedulers[0]["scheduler"]
+        lrs = {f"lr_group_{i}": lr for i, lr in enumerate(lr_scheduler.get_lr())}
+        pl_module.logger.log_metrics(lrs)
+
+    def on_validation_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        rank_zero_info("***** Validation results *****")
+        metrics = trainer.callback_metrics
+        # Log results
+        for key in sorted(metrics):
+            if key not in ["log", "progress_bar"]:
+                rank_zero_info("{} = {}\n".format(key, str(metrics[key])))
+
+    def on_test_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        rank_zero_info("***** Test results *****")
+        metrics = trainer.callback_metrics
+        # Log and save results to file
+        output_test_results_file = os.path.join(
+            pl_module.hparams.output_dir, "test_results.txt"
+        )
+        with open(output_test_results_file, "w") as writer:
+            for key in sorted(metrics):
+                if key not in ["log", "progress_bar"]:
+                    rank_zero_info("{} = {}\n".format(key, str(metrics[key])))
+                    writer.write("{} = {}\n".format(key, str(metrics[key])))
+
+def add_generic_args(parser, root_dir) -> None:
+    #  To allow all pl args uncomment the following line
+    #  parser = pl.Trainer.add_argparse_args(parser)
+    parser.add_argument(
+        "--output_dir",
+        default=None,
+        type=str,
+        required=True,
+        help="The output directory where the model predictions and checkpoints will be written.",
+    )
+    parser.add_argument(
+        "--fp16",
+        action="store_true",
+        help="Whether to use 16-bit (mixed) precision (through NVIDIA apex) instead of 32-bit",
+    )
+
+    parser.add_argument(
+        "--fp16_opt_level",
+        type=str,
+        default="O2",
+        help="For fp16: Apex AMP optimization level selected in ['O0', 'O1', 'O2', and 'O3']."
+        "See details at https://nvidia.github.io/apex/amp.html",
+    )
+    parser.add_argument("--n_tpu_cores", dest="tpu_cores", type=int)
+    parser.add_argument(
+        "--max_grad_norm",
+        dest="gradient_clip_val",
+        default=1.0,
+        type=float,
+        help="Max gradient norm",
+    )
+    parser.add_argument(
+        "--do_train", action="store_true", help="Whether to run training."
+    )
+    parser.add_argument(
+        "--do_predict",
+        action="store_true",
+        help="Whether to run predictions on the test set.",
+    )
+    parser.add_argument(
+        "--gradient_accumulation_steps",
+        dest="accumulate_grad_batches",
+        type=int,
+        default=1,
+        help="Number of updates steps to accumulate before performing a backward/update pass.",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42, help="random seed for initialization"
+    )
+    parser.add_argument(
+        "--data_dir",
+        default=None,
+        type=str,
+        required=True,
+        help="The input data dir. Should contain the training files for the CoNLL-2003 NER task.",
+    )
+
+def generic_train(
+    model: TokenClassificationModule,
+    args: Namespace,
+    early_stopping_callback=None,
+    logger=True,  # can pass WandbLogger() here
+    extra_callbacks=[],
+    checkpoint_callback=None,
+    logging_callback=None,
+    **extra_train_kwargs,
+):
+    pl.seed_everything(args.seed)
+
+    # init model
+    odir = Path(model.hparams.output_dir)
+    odir.mkdir(exist_ok=True)
+
+    # add custom checkpoints
+    if checkpoint_callback is None:
+        checkpoint_callback = pl.callbacks.ModelCheckpoint(
+            filepath=args.output_dir,
+            prefix="checkpoint",
+            monitor="val_loss",
+            mode="min",
+            save_top_k=1,
+        )
+    if early_stopping_callback:
+        extra_callbacks.append(early_stopping_callback)
+    if logging_callback is None:
+        logging_callback = LoggingCallback()
+
+    train_params = {}
+
+    # TODO: remove with PyTorch 1.6 since pl uses native amp
+    if args.fp16:
+        train_params["precision"] = 16
+        train_params["amp_level"] = args.fp16_opt_level
+
+    if args.gpus > 1:
+        train_params["distributed_backend"] = "ddp"
+
+    train_params["accumulate_grad_batches"] = args.accumulate_grad_batches
+    train_params["accelerator"] = extra_train_kwargs.get("accelerator", None)
+    train_params["profiler"] = extra_train_kwargs.get("profiler", None)
+
+    trainer = pl.Trainer.from_argparse_args(
+        args,
+        weights_summary=None,
+        callbacks=[logging_callback] + extra_callbacks,
+        logger=logger,
+        checkpoint_callback=checkpoint_callback,
+        **train_params,
+    )
+
+    return trainer
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = ArgumentParser()
     add_generic_args(parser, os.getcwd())
-    parser = TokenClassification.add_model_specific_args(parser, os.getcwd())
+    parser = TokenClassificationModule.add_model_specific_args(parser, os.getcwd())
     args = parser.parse_args()
 
     # If output_dir not provided, a folder will be generated in pwd
@@ -907,7 +1049,7 @@ if __name__ == "__main__":
         )
         os.makedirs(args.output_dir)
 
-    model = TokenClassification(args)
+    model = TokenClassificationModule(args)
     trainer = generic_train(model, args)
 
     trainer.fit(model)
