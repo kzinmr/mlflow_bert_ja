@@ -1,7 +1,8 @@
 import logging
 import os
+import random
 from argparse import ArgumentParser, Namespace
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from itertools import product, starmap
 from pathlib import Path
@@ -80,34 +81,34 @@ class InputFeatures:
     label_ids: Optional[IntList] = None
 
 
-# @dataclass
-# class InputFeaturesBatch:
-#     input_ids: torch.Tensor = field(init=False)
-#     attention_mask: torch.Tensor = field(init=False)
-#     token_type_ids: Optional[torch.Tensor] = field(init=False)
-#     label_ids: Optional[torch.Tensor] = field(init=False)
+@dataclass
+class InputFeaturesBatch:
+    input_ids: torch.Tensor = field(init=False)
+    attention_mask: torch.Tensor = field(init=False)
+    token_type_ids: Optional[torch.Tensor] = field(init=False)
+    label_ids: Optional[torch.Tensor] = field(init=False)
 
-#     def __getitem__(self, item):
-#         return getattr(self, item)
+    def __getitem__(self, item):
+        return getattr(self, item)
 
-#     def __post_init__(self, features: List[InputFeatures]):
-#         input_ids: IntListList = []
-#         masks: IntListList = []
-#         token_type_ids: IntListList = []
-#         label_ids: IntListList = []
-#         for f in features:
-#             input_ids.append(f.input_ids)
-#             masks.append(f.attention_mask)
-#             if f.token_type_ids is not None:
-#                 token_type_ids.append(f.token_type_ids)
-#             if f.label_ids is not None:
-#                 label_ids.append(f.label_ids)
-#         self.input_ids = torch.LongTensor(input_ids)
-#         self.attention_mask = torch.LongTensor(masks)
-#         if token_type_ids:
-#             self.token_type_ids = torch.LongTensor(token_type_ids)
-#         if label_ids:
-#             self.label_ids = torch.LongTensor(label_ids)
+    def __post_init__(self, features: List[InputFeatures]):
+        input_ids: IntListList = []
+        masks: IntListList = []
+        token_type_ids: IntListList = []
+        label_ids: IntListList = []
+        for f in features:
+            input_ids.append(f.input_ids)
+            masks.append(f.attention_mask)
+            if f.token_type_ids is not None:
+                token_type_ids.append(f.token_type_ids)
+            if f.label_ids is not None:
+                label_ids.append(f.label_ids)
+        self.input_ids = torch.LongTensor(input_ids)
+        self.attention_mask = torch.LongTensor(masks)
+        if token_type_ids:
+            self.token_type_ids = torch.LongTensor(token_type_ids)
+        if label_ids:
+            self.label_ids = torch.LongTensor(label_ids)
 
 
 def read_labels(path: str) -> StrList:
@@ -386,31 +387,37 @@ class TokenClassificationDataModule(pl.LightningDataModule):
         """
         pass
 
+    def get_dataloader(self, ds: NERDataset, bs: int, shuffle: bool) -> DataLoader:
+        return DataLoader(
+            ds,
+            collate_fn=InputFeaturesBatch,
+            batch_size=bs,
+            num_workers=self.num_workers,
+            shuffle=shuffle,
+        )
+
     @property
     def train_dataloader(self):
-        return DataLoader(
+        return self.get_dataloader(
             self.train_dataset,
-            batch_size=self.train_batch_size,
-            num_workers=self.num_workers,
+            self.train_batch_size,
             shuffle=True,
         )
 
     @property
     def val_dataloader(self):
-        return DataLoader(
+        return self.get_dataloader(
             self.dev_dataset,
-            batch_size=self.eval_batch_size,
-            num_workers=self.num_workers,
-            shuffle=False,
+            self.eval_batch_size,
+            shuffle=True,
         )
 
     @property
     def test_dataloader(self):
-        return DataLoader(
+        return self.get_dataloader(
             self.test_dataset,
-            batch_size=self.eval_batch_size,
-            num_workers=self.num_workers,
-            shuffle=False,
+            self.eval_batch_size,
+            shuffle=True,
         )
 
     @staticmethod
@@ -958,6 +965,11 @@ if __name__ == "__main__":
 
     # init
     pl.seed_everything(args.seed)
+    random.seed(args.seed)
+    os.environ["PYTHONHASHSEED"] = str(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
     Path(args.output_dir).mkdir(exist_ok=True)
 
     mlflow.pytorch.autolog()
