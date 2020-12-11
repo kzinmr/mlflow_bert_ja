@@ -3,56 +3,61 @@ import glob
 import logging
 import os
 from argparse import ArgumentParser, Namespace
+from dataclasses import dataclass, field
+from enum import Enum
+from itertools import product
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Final, List, Optional, Set, TextIO, Union
+from typing_extensions import TypedDict
 
 import numpy as np
+import pytorch_lightning as pl
 import torch
+
+from pytorch_lightning.utilities import rank_zero_info
 from seqeval.metrics import accuracy_score, f1_score, precision_score, recall_score
 from torch.nn import CrossEntropyLoss
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 
-import pytorch_lightning as pl
-from pytorch_lightning.utilities import rank_zero_info
-
-from lightning_base import add_generic_args
-
-from dataclasses import dataclass
-from enum import Enum
-from typing import Final, List, Optional, TextIO, Union
+from tokenizers import Encoding
 from transformers import (
     AdamW,
     AutoConfig,
     AutoModelForTokenClassification,
     AutoTokenizer,
+    BatchEncoding,
     PretrainedConfig,
     PreTrainedModel,
     PreTrainedTokenizer,
+    PreTrainedTokenizerFast,
 )
 from transformers.optimization import Adafactor
 from transformers.modeling_outputs import TokenClassifierOutput
 
+
 logger = logging.getLogger(__name__)
 PAD_TOKEN_LABEL_ID: Final[int] = CrossEntropyLoss().ignore_index
-
-@dataclass
-class InputFeatures:
-    """
-    A single set of features of data.
-    Property names are the same names as the corresponding inputs to a model.
-    """
-
-    text: str
-    input_ids: List[int]
-    attention_mask: List[int]
-    token_type_ids: Optional[List[int]] = None
-    label_ids: Optional[List[int]] = None
+IntList = List[int]
+IntListList = List[IntList]
+StrList = List[str]
 
 
 class Split(Enum):
     train = "train"
     dev = "dev"
     test = "test"
+
+
+class ExpectedAnnotationShape(TypedDict):
+    start: int
+    end: int
+    label: str
+
+
+class ExpectedDataItemShape(TypedDict):
+    content: str  # The Text to be annotated
+    annotations: List[ExpectedAnnotationShape]
+
 
 @dataclass
 class InputExample:
@@ -69,417 +74,445 @@ class InputExample:
     words: List[str]
     labels: Optional[List[str]]
 
+def read_labels(path: str) -> StrList:
+    with open(path, "r") as f:
+        labels = f.read().splitlines()
+    if "O" not in labels:
+        labels = ["O"] + labels
+    return labels
 
-# en: tokenizer.tokenize: word -> pieces
-# ja: tokenizer.tokenize: text -> wordpieces  ??
-class NERDataset(Dataset):
-    def __init__(self, texts, labels, tokenizer, max_length):
-        """
-        Performs initialization of tokenizer
-        :param texts: document texts
-        :param labels: labels
-        :param tokenizer: bert tokenizer
-        :param max_length: maximum length of the news text
-        """
-        self.texts = texts
-        self.labels = labels
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        self.__texts_len = len(texts)
+def read_examples_from_file(
+    data_dir: str,
+    mode: Union[Split, str],
+    label_idx: int = -1,
+    delimiter: str = " ",
+) -> List[InputExample]:
+    # TODO: InputExample -> ExpectedDataItemShape
+    # TokenData -> SpanData
+    if isinstance(mode, Split):
+        mode = mode.value
+    file_path = os.path.join(data_dir, f"{mode}.txt")
+    guid_index = 1
+    examples = []
+    with open(file_path, encoding="utf-8") as f:
+        words = []
+        labels = []
+        for line in f:
+            if line.startswith("-DOCSTART-") or line == "" or line == "\n":
+                if words:
+                    examples.append(
+                        InputExample(
+                            guid=f"{mode}-{guid_index}", words=words, labels=labels
+                        )
+                    )
+                    guid_index += 1
+                    words = []
+                    labels = []
+            else:
+                splits = line.strip().split(delimiter)
+                words.append(splits[0])
+                if len(splits) > 1:
+                    labels.append(splits[label_idx])
+                else:
+                    # for mode = "test"
+                    labels.append("O")
+        if words:
+            examples.append(
+                InputExample(guid=f"{mode}-{guid_index}", words=words, labels=labels)
+            )
+    return examples
 
-    def __len__(self):
-        """
-        :return: returns the number of datapoints in the dataframe
-        """
-        return self.__texts_len
+
+@dataclass
+class InputFeatures:
+    """
+    A single set of features of data.
+    Property names are the same names as the corresponding inputs to a model.
+    """
+
+    input_ids: IntList
+    attention_mask: IntList
+    token_type_ids: Optional[IntList] = None
+    label_ids: Optional[IntList] = None
+
+
+@dataclass
+class InputFeaturesBatch:
+    input_ids: torch.Tensor = field(init=False)
+    attention_mask: torch.Tensor = field(init=False)
+    token_type_ids: Optional[torch.Tensor] = field(init=False)
+    label_ids: Optional[torch.Tensor] = field(init=False)
 
     def __getitem__(self, item):
-        """
-        Returns the text and the labels of the specified item
-        :param item: Index of sample text
-        :return: Returns the dictionary of text, input ids, attention mask, labels
-        """
-        text = str(self.texts[item])
-        label = self.labels[item]
+        return getattr(self, item)
 
-        encoding = self.tokenizer.encode_plus(
-            text,
-            add_special_tokens=True,
-            max_length=self.max_length,
-            return_token_type_ids=False,
-            padding="max_length",
-            return_attention_mask=True,
-            return_tensors="pt",
-            truncation=True,
+    def __post_init__(self, features: List[InputFeatures]):
+        input_ids: IntListList = []
+        masks: IntListList = []
+        token_type_ids: IntListList = []
+        label_ids: IntListList = []
+        for f in features:
+            input_ids.append(f.input_ids)
+            masks.append(f.attention_mask)
+            if f.token_type_ids is not None:
+                token_type_ids.append(f.token_type_ids)
+            if f.label_ids is not None:
+                label_ids.append(f.label_ids)
+        self.input_ids = torch.LongTensor(input_ids)
+        self.attention_mask = torch.LongTensor(masks)
+        if token_type_ids:
+            self.token_type_ids = torch.LongTensor(token_type_ids)
+        if label_ids:
+            self.label_ids = torch.LongTensor(label_ids)
+
+
+class LabelSet:
+    def __init__(self, labels: StrList):
+        self.labels_to_id = {"O": 0}
+        self.ids_to_label = {0: "O"}
+        for i, (label, s) in enumerate(product(labels, "BILU"), 1):
+            l = f"{s}-{label}"
+            self.labels_to_id[l] = i
+            self.ids_to_label[i] = l
+
+    @staticmethod
+    def align_tokens_and_annotations_bilou(
+        tokenized: Encoding, annotations: List[ExpectedAnnotationShape]
+    ) -> StrList:
+        aligned_labels = ["O"] * len(
+            tokenized.tokens
+        )  # Make a list to store our labels the same length as our tokens
+        for anno in annotations:
+            annotation_token_ix_set: Set[
+                int
+            ] = set()  # A set that stores the token indices of the annotation
+            for char_ix in range(anno["start"], anno["end"]):
+                token_ix = tokenized.char_to_token(char_ix)
+                if token_ix is not None:
+                    annotation_token_ix_set.add(token_ix)
+            if len(annotation_token_ix_set) == 1:
+                # If there is only one token
+                token_ix = annotation_token_ix_set.pop()
+                prefix = "U"  # This annotation spans one token so is prefixed with U for unique
+                aligned_labels[token_ix] = f"{prefix}-{anno['label']}"
+
+            else:
+
+                last_token_in_anno_ix = len(annotation_token_ix_set) - 1
+                for num, token_ix in enumerate(sorted(annotation_token_ix_set)):
+                    if num == 0:
+                        prefix = "B"
+                    elif num == last_token_in_anno_ix:
+                        prefix = "L"  # Its the last token
+                    else:
+                        prefix = "I"  # We're inside of a multi token annotation
+                    aligned_labels[token_ix] = f"{prefix}-{anno['label']}"
+        return aligned_labels
+
+    def get_aligned_label_ids_from_annotations(
+        self, tokenized_text: Encoding, annotations: List[ExpectedAnnotationShape]
+    ) -> IntList:
+        # TODO: switch label encoding scheme, align_tokens_and_annotations_bio
+        raw_labels = self.align_tokens_and_annotations_bilou(
+            tokenized_text, annotations
         )
+        return list(map(lambda x: self.labels_to_id.get(x, 0), raw_labels))
 
-        TOKEN_TYPE_IDS = None
 
-        return InputFeatures(
-            text,
-            encoding["input_ids"].flatten(),
-            encoding["attention_mask"].flatten(),
-            TOKEN_TYPE_IDS,
-            torch.tensor(label, dtype=torch.long),
+def convert_examples_to_features(
+    examples: List[InputExample],
+    label_list: List[str],
+    max_seq_length: int,
+    tokenizer: PreTrainedTokenizer,
+    is_xlnet: bool = False,
+    sequence_a_segment_id=0,
+    mask_padding_with_zero=True,
+) -> List[InputFeatures]:
+    """Loads a data file into a list of `InputFeatures`
+    `cls_token_at_end` define the location of the CLS token:
+        - False (Default, BERT/XLM pattern): [CLS] + A + [SEP] + B + [SEP]
+        - True (XLNet/GPT pattern): A + [SEP] + B + [SEP] + [CLS]
+    `cls_token_segment_id` define the segment id associated to the CLS token (0 for BERT, 2 for XLNet)
+    """
+    # TODO clean up all this to leverage built-in features of tokenizers
+    cls_token_at_end = is_xlnet
+    cls_token = tokenizer.cls_token
+    cls_token_segment_id = 2 if is_xlnet else 0
+    sep_token = tokenizer.sep_token
+    sep_token_extra = False
+    pad_on_left = is_xlnet
+    pad_token = tokenizer.pad_token_id
+    pad_token_segment_id = tokenizer.pad_token_type_id
+
+    label_map = {label: i for i, label in enumerate(label_list)}
+
+    features: List[InputFeatures] = []
+    for (ex_index, example) in enumerate(examples):
+        if ex_index % 10_000 == 0:
+            logger.info("Writing example %d of %d", ex_index, len(examples))
+
+        tokens = []
+        label_ids = []
+        if example.labels is not None:
+            for word, label in zip(example.words, example.labels):
+                word_tokens = tokenizer.tokenize(word)
+
+                # bert-base-multilingual-cased sometimes output "nothing ([]) when calling tokenize with just a space.
+                if len(word_tokens) > 0:
+                    tokens.extend(word_tokens)
+                    # Use the real label id for the first token of the word, and padding ids for the remaining tokens
+                    label_ids.extend(
+                        [label_map[label]]  # * len(word_tokens)
+                        + [PAD_TOKEN_LABEL_ID] * (len(word_tokens) - 1)
+                    )
+
+            # Account for [CLS] and [SEP] with "- 2" and with "- 3" for RoBERTa.
+            special_tokens_count = tokenizer.num_special_tokens_to_add()
+            if len(tokens) > max_seq_length - special_tokens_count:
+                tokens = tokens[: (max_seq_length - special_tokens_count)]
+                label_ids = label_ids[: (max_seq_length - special_tokens_count)]
+
+            # The convention in BERT is:
+            # (a) For sequence pairs:
+            #  tokens:   [CLS] is this jack ##son ##ville ? [SEP] no it is not . [SEP]
+            #  type_ids:   0   0  0    0    0     0       0   0   1  1  1  1   1   1
+            # (b) For single sequences:
+            #  tokens:   [CLS] the dog is hairy . [SEP]
+            #  type_ids:   0   0   0   0  0     0   0
+            #
+            # Where "type_ids" are used to indicate whether this is the first
+            # sequence or the second sequence. The embedding vectors for `type=0` and
+            # `type=1` were learned during pre-training and are added to the wordpiece
+            # embedding vector (and position vector). This is not *strictly* necessary
+            # since the [SEP] token unambiguously separates the sequences, but it makes
+            # it easier for the model to learn the concept of sequences.
+            #
+            # For classification tasks, the first vector (corresponding to [CLS]) is
+            # used as as the "sentence vector". Note that this only makes sense because
+            # the entire model is fine-tuned.
+            tokens += [sep_token]
+            label_ids += [PAD_TOKEN_LABEL_ID]
+            if sep_token_extra:
+                # roberta uses an extra separator b/w pairs of sentences
+                tokens += [sep_token]
+                label_ids += [PAD_TOKEN_LABEL_ID]
+            segment_ids = [sequence_a_segment_id] * len(tokens)
+
+            if cls_token_at_end:
+                tokens += [cls_token]
+                label_ids += [PAD_TOKEN_LABEL_ID]
+                segment_ids += [cls_token_segment_id]
+            else:
+                tokens = [cls_token] + tokens
+                label_ids = [PAD_TOKEN_LABEL_ID] + label_ids
+                segment_ids = [cls_token_segment_id] + segment_ids
+
+            input_ids: List[int] = tokenizer.convert_tokens_to_ids(tokens)
+
+            # The mask has 1 for real tokens and 0 for padding tokens. Only real
+            # tokens are attended to.
+            input_mask = [1 if mask_padding_with_zero else 0] * len(input_ids)
+
+            # Zero-pad up to the sequence length.
+            padding_length = max_seq_length - len(input_ids)
+            if pad_on_left:
+                input_ids = ([pad_token] * padding_length) + input_ids
+                input_mask = (
+                    [0 if mask_padding_with_zero else 1] * padding_length
+                ) + input_mask
+                segment_ids = [pad_token_segment_id] * padding_length + segment_ids
+                label_ids = ([PAD_TOKEN_LABEL_ID] * padding_length) + label_ids
+            else:
+                input_ids += [pad_token] * padding_length
+                input_mask += [0 if mask_padding_with_zero else 1] * padding_length
+                segment_ids += [pad_token_segment_id] * padding_length
+                label_ids += [PAD_TOKEN_LABEL_ID] * padding_length
+
+            assert len(input_ids) == max_seq_length
+            assert len(input_mask) == max_seq_length
+            assert len(segment_ids) == max_seq_length
+            assert len(label_ids) == max_seq_length
+
+            if ex_index < 5:
+                logger.info("*** Example ***")
+                logger.info("guid: %s", example.guid)
+                logger.info("tokens: %s", " ".join([str(x) for x in tokens]))
+                logger.info("input_ids: %s", " ".join([str(x) for x in input_ids]))
+                logger.info("input_mask: %s", " ".join([str(x) for x in input_mask]))
+                logger.info("segment_ids: %s", " ".join([str(x) for x in segment_ids]))
+                logger.info("label_ids: %s", " ".join([str(x) for x in label_ids]))
+
+            if "token_type_ids" not in tokenizer.model_input_names:
+                segment_ids = None
+
+            features.append(
+                InputFeatures(
+                    input_ids=input_ids,
+                    attention_mask=input_mask,
+                    token_type_ids=segment_ids,
+                    label_ids=label_ids,
+                )
+            )
+
+    return features
+
+
+class NERDataset(Dataset):
+    def __init__(
+        self,
+        data: List[InputExample], # List[ExpectedAnnotationShape],
+        label_set: LabelSet,
+        tokenizer: PreTrainedTokenizerFast,
+        tokens_per_batch=32,
+    ):
+        self.label_set = label_set
+        self.tokenizer = tokenizer
+        self.texts: StrList = []
+        self.annotations: List[List[ExpectedAnnotationShape]] = []
+        self.training_examples: List[InputFeatures] = []
+
+        for example in data:
+            self.texts.append(example["content"])
+            self.annotations.append(example["annotations"])
+        ###TOKENIZE All THE DATA
+        tokenized_batch: BatchEncoding = self.tokenizer(
+            self.texts, add_special_tokens=False
         )
+        encodings: List[Encoding] = tokenized_batch.encodings
+        # LABEL ALIGNMENT
+        aligned_labels: IntListList = [
+            label_set.get_aligned_label_ids_from_annotations(encoding, raw_annotations)
+            for encoding, raw_annotations in zip(encodings, self.annotations)
+        ]
+
+        for encoding, label_ids in zip(encodings, aligned_labels):
+            seq_length = len(label_ids)
+            for start in range(0, seq_length, tokens_per_batch):
+                end = min(start + tokens_per_batch, seq_length)
+                n_padding_to_add = max(0, tokens_per_batch - end + start)
+                self.training_examples.append(
+                    InputFeatures(
+                        input_ids=encoding.ids[start:end]
+                        + [self.tokenizer.pad_token_id] * n_padding_to_add,
+                        label_ids=(
+                            label_ids[start:end]
+                            + [PAD_TOKEN_LABEL_ID] * n_padding_to_add
+                        ),
+                        attention_mask=(
+                            encoding.attention_mask[start:end] + [0] * n_padding_to_add
+                        ),
+                    )
+                )
+
+    def __len__(self):
+        return len(self.training_examples)
+
+    def __getitem__(self, idx) -> InputFeatures:
+
+        return self.training_examples[idx]
+
 
 class TokenClassificationDataModule(pl.LightningDataModule):
-    def __init__(self, label_idx=-1, **kwargs):
+    def __init__(self, **kwargs):
         """
         Initialization of inherited lightning data module
         """
-        # in NER datasets, the last column is usually reserved for NER label
-        self.label_idx = label_idx        
+        self.tokenizer: PreTrainedTokenizerFast
+        self.train_examples: List[InputExample]
+        self.dev_examples: List[InputExample]
+        self.test_examples: List[InputExample]
+        self.train_dataset: NERDataset
+        self.dev_dataset: NERDataset
+        self.test_dataset: NERDataset
 
-        super(TokenClassificationDataModule, self).__init__()
-        # self.df_train = None
-        # self.df_val = None
-        # self.df_test = None
-        self.train_data_loader = None
-        self.val_data_loader = None
-        self.test_data_loader = None
-        self.max_seq_length = kwargs.max_seq_length
-        self.encoding = None
-        self.tokenizer = None
-        self.args = kwargs
-
-
-    def read_examples_from_file(
-        self, data_dir, mode: Union[Split, str]
-    ) -> List[InputExample]:
-        if isinstance(mode, Split):
-            mode = mode.value
-        file_path = os.path.join(data_dir, f"{mode}.txt")
-        guid_index = 1
-        examples = []
-        with open(file_path, encoding="utf-8") as f:
-            words = []
-            labels = []
-            for line in f:
-                if line.startswith("-DOCSTART-") or line == "" or line == "\n":
-                    if words:
-                        examples.append(
-                            InputExample(
-                                guid=f"{mode}-{guid_index}", words=words, labels=labels
-                            )
-                        )
-                        guid_index += 1
-                        words = []
-                        labels = []
-                else:
-                    splits = line.split(" ")
-                    words.append(splits[0])
-                    if len(splits) > 1:
-                        labels.append(splits[self.label_idx].replace("\n", ""))
-                    else:
-                        # Examples could have no label for mode = "test"
-                        labels.append("O")
-            if words:
-                examples.append(
-                    InputExample(
-                        guid=f"{mode}-{guid_index}", words=words, labels=labels
-                    )
-                )
-        return examples
-
-    @staticmethod
-    def convert_examples_to_features(
-        examples: List[InputExample],
-        label_list: List[str],
-        max_seq_length: int,
-        tokenizer: PreTrainedTokenizer,
-        cls_token_at_end=False,
-        cls_token="[CLS]",
-        cls_token_segment_id=1,
-        sep_token="[SEP]",
-        sep_token_extra=False,
-        pad_on_left=False,
-        pad_token=0,
-        pad_token_segment_id=0,
-        pad_token_label_id=-100,
-        sequence_a_segment_id=0,
-        mask_padding_with_zero=True,
-    ) -> List[InputFeatures]:
-        """Loads a data file into a list of `InputFeatures`
-        `cls_token_at_end` define the location of the CLS token:
-            - False (Default, BERT/XLM pattern): [CLS] + A + [SEP] + B + [SEP]
-            - True (XLNet/GPT pattern): A + [SEP] + B + [SEP] + [CLS]
-        `cls_token_segment_id` define the segment id associated to the CLS token (0 for BERT, 2 for XLNet)
-        """
-        # TODO clean up all this to leverage built-in features of tokenizers
-
-        label_map = {label: i for i, label in enumerate(label_list)}
-
-        features: List[InputFeatures] = []
-        for (ex_index, example) in enumerate(examples):
-            if ex_index % 10_000 == 0:
-                logger.info("Writing example %d of %d", ex_index, len(examples))
-
-            tokens = []
-            label_ids = []
-            if example.labels is not None:
-                for word, label in zip(example.words, example.labels):
-                    word_tokens = tokenizer.tokenize(word)
-
-                    # bert-base-multilingual-cased sometimes output "nothing ([]) when calling tokenize with just a space.
-                    if len(word_tokens) > 0:
-                        tokens.extend(word_tokens)
-                        # Use the real label id for the first token of the word, and padding ids for the remaining tokens
-                        label_ids.extend(
-                            [label_map[label]]   # * len(word_tokens)
-                            + [pad_token_label_id] * (len(word_tokens) - 1)
-                        )
-
-                # Account for [CLS] and [SEP] with "- 2" and with "- 3" for RoBERTa.
-                special_tokens_count = tokenizer.num_special_tokens_to_add()
-                if len(tokens) > max_seq_length - special_tokens_count:
-                    tokens = tokens[: (max_seq_length - special_tokens_count)]
-                    label_ids = label_ids[: (max_seq_length - special_tokens_count)]
-
-                # The convention in BERT is:
-                # (a) For sequence pairs:
-                #  tokens:   [CLS] is this jack ##son ##ville ? [SEP] no it is not . [SEP]
-                #  type_ids:   0   0  0    0    0     0       0   0   1  1  1  1   1   1
-                # (b) For single sequences:
-                #  tokens:   [CLS] the dog is hairy . [SEP]
-                #  type_ids:   0   0   0   0  0     0   0
-                #
-                # Where "type_ids" are used to indicate whether this is the first
-                # sequence or the second sequence. The embedding vectors for `type=0` and
-                # `type=1` were learned during pre-training and are added to the wordpiece
-                # embedding vector (and position vector). This is not *strictly* necessary
-                # since the [SEP] token unambiguously separates the sequences, but it makes
-                # it easier for the model to learn the concept of sequences.
-                #
-                # For classification tasks, the first vector (corresponding to [CLS]) is
-                # used as as the "sentence vector". Note that this only makes sense because
-                # the entire model is fine-tuned.
-                tokens += [sep_token]
-                label_ids += [pad_token_label_id]
-                if sep_token_extra:
-                    # roberta uses an extra separator b/w pairs of sentences
-                    tokens += [sep_token]
-                    label_ids += [pad_token_label_id]
-                segment_ids = [sequence_a_segment_id] * len(tokens)
-
-                if cls_token_at_end:
-                    tokens += [cls_token]
-                    label_ids += [pad_token_label_id]
-                    segment_ids += [cls_token_segment_id]
-                else:
-                    tokens = [cls_token] + tokens
-                    label_ids = [pad_token_label_id] + label_ids
-                    segment_ids = [cls_token_segment_id] + segment_ids
-
-                input_ids: List[int] = tokenizer.convert_tokens_to_ids(tokens)
-
-                # The mask has 1 for real tokens and 0 for padding tokens. Only real
-                # tokens are attended to.
-                input_mask = [1 if mask_padding_with_zero else 0] * len(input_ids)
-
-                # Zero-pad up to the sequence length.
-                padding_length = max_seq_length - len(input_ids)
-                if pad_on_left:
-                    input_ids = ([pad_token] * padding_length) + input_ids
-                    input_mask = (
-                        [0 if mask_padding_with_zero else 1] * padding_length
-                    ) + input_mask
-                    segment_ids = [pad_token_segment_id] * padding_length + segment_ids
-                    label_ids = ([pad_token_label_id] * padding_length) + label_ids
-                else:
-                    input_ids += [pad_token] * padding_length
-                    input_mask += [0 if mask_padding_with_zero else 1] * padding_length
-                    segment_ids += [pad_token_segment_id] * padding_length
-                    label_ids += [pad_token_label_id] * padding_length
-
-                assert len(input_ids) == max_seq_length
-                assert len(input_mask) == max_seq_length
-                assert len(segment_ids) == max_seq_length
-                assert len(label_ids) == max_seq_length
-
-                if ex_index < 5:
-                    logger.info("*** Example ***")
-                    logger.info("guid: %s", example.guid)
-                    logger.info("tokens: %s", " ".join([str(x) for x in tokens]))
-                    logger.info("input_ids: %s", " ".join([str(x) for x in input_ids]))
-                    logger.info("input_mask: %s", " ".join([str(x) for x in input_mask]))
-                    logger.info("segment_ids: %s", " ".join([str(x) for x in segment_ids]))
-                    logger.info("label_ids: %s", " ".join([str(x) for x in label_ids]))
-
-                if "token_type_ids" not in tokenizer.model_input_names:
-                    segment_ids = None
-
-                text = ''.join(tokens)
-                features.append(
-                    InputFeatures(
-                        text=text,
-                        input_ids=input_ids,
-                        attention_mask=input_mask,
-                        token_type_ids=segment_ids,
-                        label_ids=label_ids,
-                    )
-                )
-        return features
-
+        super().__init__()
+        self.max_seq_length = kwargs["max_seq_length"]
+        self.cache_dir = kwargs["cache_dir"]
+        self.data_dir = kwargs["data_dir"]
+        tn = kwargs["tokenizer_name"]
+        self.tokenizer_name = tn if tn else kwargs["model_name_or_path"]
+        self.train_batch_size = kwargs["train_batch_size"]
+        self.eval_batch_size = kwargs["eval_batch_size"]
+        self.num_workers = kwargs["num_workers"]
+        self.labels = read_labels(kwargs["labels"])
+        self.label_set = LabelSet(self.labels)
+        # is_xlnet = bool(self.model_type in ["xlnet"])
 
     def prepare_data(self):
         """
         Downloads the data and prepare the tokenizer
         """
-        cache_dir = self.hparams.cache_dir if self.hparams.cache_dir else None
-        self.tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(
-                self.hparams.tokenizer_name
-                if self.hparams.tokenizer_name
-                else self.hparams.model_name_or_path,
-                cache_dir=cache_dir,
+        # trf>=4.0.0: PreTrainedTokenizerFast by default
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.tokenizer_name,
+            cache_dir=self.cache_dir,
         )
-
-        args = self.hparams
-        for mode in ["train", "dev", "test"]:
-            cached_features_file = self._feature_file(mode)
-            logger.info("Creating features from dataset file at %s", args.data_dir)
-            examples = self.read_examples_from_file(
-                args.data_dir, mode
-            )
-            features = self.convert_examples_to_features(
-                examples,
-                self.labels,
-                args.max_seq_length,
-                self.tokenizer,
-                cls_token_at_end=bool(self.config.model_type in ["xlnet"]),
-                cls_token=self.tokenizer.cls_token,
-                cls_token_segment_id=2
-                if self.config.model_type in ["xlnet"]
-                else 0,
-                sep_token=self.tokenizer.sep_token,
-                sep_token_extra=False,
-                pad_on_left=bool(self.config.model_type in ["xlnet"]),
-                pad_token=self.tokenizer.pad_token_id,
-                pad_token_segment_id=self.tokenizer.pad_token_type_id,
-                pad_token_label_id=PAD_TOKEN_LABEL_ID,
-            )
-            logger.info("Saving features into cached file %s", cached_features_file)
-            torch.save(features, cached_features_file)
-
-    def _feature_file(self, mode):
-        return os.path.join(
-            self.hparams.data_dir,
-            "cached_{}_{}_{}".format(
-                mode,
-                list(filter(None, self.hparams.model_name_or_path.split("/"))).pop(),
-                str(self.hparams.max_seq_length),
-            ),
-        )
-
-    def get_dataloader(
-        self, mode: int, batch_size: int, num_workers: int, shuffle: bool = False,
-    ) -> DataLoader:
-        "Load datasets. Called after prepare data."
-
-        cached_features_file = self._feature_file(mode)
-        features: List[InputFeatures] = torch.load(cached_features_file)
-        all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
-        all_attention_mask = torch.tensor(
-            [f.attention_mask for f in features], dtype=torch.long
-        )
-        all_token_type_ids = torch.tensor(
-            [f.token_type_ids for f in features], dtype=torch.long
-        )
-        all_label_ids = torch.tensor([f.label_ids for f in features], dtype=torch.long)
-        ds = TensorDataset(
-                all_input_ids, all_attention_mask, all_token_type_ids, all_label_ids
-        )
-
-        return DataLoader(
-            ds,
-            batch_size=batch_size, num_workers=num_workers,
-        )
-
-    def train_dataloader(self):
-        return self.get_dataloader("train", self.hparams.train_batch_size, self.hparams.num_workers, shuffle=True)
-
-    def val_dataloader(self):
-        return self.get_dataloader("dev", self.hparams.eval_batch_size, self.hparams.num_workers, shuffle=False)
-
-    def test_dataloader(self):
-        return self.get_dataloader("test", self.hparams.eval_batch_size, self.hparams.num_workers, shuffle=False)
-
-
+        self.train_examples = read_examples_from_file(self.data_dir, Split.train)
+        self.dev_examples = read_examples_from_file(self.data_dir, Split.dev)
+        self.test_examples = read_examples_from_file(self.data_dir, Split.test)
 
     def setup(self, stage=None):
-        # """
-        # split the data into train, test, validation data
-        # :param stage: Stage - training or testing
-        # """
-
-        # df = self.df_use
-
+        """
+        split the data into train, test, validation data
+        :param stage: Stage - training or testing
+        """
         # # NOTE: (fixed) np.random random_state is used by default
-        # df_train, df_test = train_test_split(
-        #     df, test_size=0.3, stratify=df[LABEL_COL_NAME]
+        # train, test = train_test_split(
+        #     data, test_size=0.3, stratify=data[LABEL_COL_NAME]
         # )
-        # df_val, df_test = train_test_split(
-        #     df_test, test_size=0.5, stratify=df_test[LABEL_COL_NAME]
+        # dev, test = train_test_split(
+        #     test, test_size=0.5, stratify=test[LABEL_COL_NAME]
         # )
+        pass
 
-        # self.df_train = df_train
-        # self.df_test = df_test
-        # self.df_val = df_val
+    @property
+    def train_dataset(self):
+        return NERDataset(
+            self.train_examples, self.label_set, self.tokenizer, self.max_seq_length
+        )
 
-    # def create_data_loader(self, df, tokenizer, batch_size, num_workers):
-    #     """
-    #     Generic data loader function
-    #     :param df: Input dataframe
-    #     :param tokenizer: bert tokenizer
-    #     :param batch_size: Batch size for training
-    #     :return: Returns the constructed dataloader
-    #     """
-    #     texts = df[TEXT_COL_NAME].to_numpy()
-    #     labels = df[LABEL_COL_NAME].to_numpy()
-    #     ds = NERDataset(
-    #         texts=texts,
-    #         labels=labels,
-    #         tokenizer=tokenizer,
-    #         max_length=self.max_seq_length,
-    #     )
+    @property
+    def val_dataset(self):
+        return NERDataset(
+            self.dev_examples, self.label_set, self.tokenizer, self.max_seq_length
+        )
 
-    #     return DataLoader(
-    #         ds, batch_size=batch_size, num_workers=num_workers,
-    #     )
+    @property
+    def test_dataset(self):
+        return NERDataset(
+            self.test_examples, self.label_set, self.tokenizer, self.max_seq_length
+        )
 
-    # def train_dataloader(self):
-    #     """
-    #     :return: output - Train data loader for the given input
-    #     """
-    #     self.train_data_loader = self.create_data_loader(
-    #         self.df_train, self.tokenizer, self.args["train_batch_size"], self.args["num_workers"]
-    #     )
-    #     return self.train_data_loader
+    @property
+    def train_dataloader(self):
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.train_batch_size,
+            num_workers=self.num_workers,
+            shuffle=True,
+        )
 
-    # def val_dataloader(self):
-    #     """
-    #     :return: output - Validation data loader for the given input
-    #     """
-    #     self.val_data_loader = self.create_data_loader(
-    #         self.df_val, self.tokenizer, self.args["eval_batch_size"], self.args["num_workers"]
-    #     )
-    #     return self.val_data_loader
+    @property
+    def val_dataloader(self):
+        return DataLoader(
+            self.dev_dataset,
+            batch_size=self.eval_batch_size,
+            num_workers=self.num_workers,
+            shuffle=False,
+        )
 
-    # def test_dataloader(self):
-    #     """
-    #     :return: output - Test data loader for the given input
-    #     """
-    #     self.test_data_loader = self.create_data_loader(
-    #         self.df_test, self.tokenizer, self.args["eval_batch_size"], self.args["num_workers"]
-    #     )
-    #     return self.test_data_loader
+    @property
+    def test_dataloader(self):
+        return DataLoader(
+            self.test_dataset,
+            batch_size=self.eval_batch_size,
+            num_workers=self.num_workers,
+            shuffle=False,
+        )
 
-
-
-
-
+    @staticmethod
     def write_predictions_to_file(
-        self, writer: TextIO, test_input_reader: TextIO, preds_list: List
+        writer: TextIO, test_input_reader: TextIO, preds_list: List
     ):
         example_id = 0
         for line in test_input_reader:
@@ -521,7 +554,7 @@ class TokenClassificationDataModule(pl.LightningDataModule):
         parser.add_argument(
             "--num_workers",
             type=int,
-            default=3,
+            default=4,
             metavar="N",
             help="number of workers (default: 3)",
         )
@@ -540,11 +573,6 @@ class TokenClassificationDataModule(pl.LightningDataModule):
             help="Path to a file containing all labels. If not specified, CoNLL-2003 labels are used.",
         )
         parser.add_argument(
-            "--overwrite_cache",
-            action="store_true",
-            help="Overwrite the cached training and evaluation sets",
-        )
-        parser.add_argument(
             "--model_name_or_path",
             default=None,
             type=str,
@@ -558,14 +586,8 @@ class TokenClassificationDataModule(pl.LightningDataModule):
             help="(Common)Pretrained tokenizer name or path if not the same as model_name",
         )
         parser.add_argument(
-            "--cache_dir",
-            default="",
-            type=str,
-            help="(Common)Where do you want to store the pre-trained models downloaded from huggingface.co",
-        )
-        parser.add_argument(
             "--data_dir",
-            default='ner_data',
+            default="ner_data",
             type=str,
             required=True,
             help="The input data dir. Should contain the training files for the CoNLL-2003 NER task.",
@@ -573,17 +595,15 @@ class TokenClassificationDataModule(pl.LightningDataModule):
         return parser
 
 
-
 class TokenClassificationModule(pl.LightningModule):
-
     def __init__(self, hparams):
         """Initialize a model and config for token-classification"""
         if type(hparams) == dict:
             hparams = Namespace(**hparams)
 
-        self.labels = self._get_labels(hparams.labels)
-        self.label_map = {i: label for i, label in enumerate(self.labels)}
-        num_labels = len(self.labels)
+        labels = read_labels(hparams.labels)
+        num_labels = len(labels)
+        self.label_map = {i: label for i, label in enumerate(labels)}
         self.scheduler = None
         self.optimizer = None
 
@@ -594,7 +614,7 @@ class TokenClassificationModule(pl.LightningModule):
         # can also expand arguments into trainer signature for easier reading
 
         self.save_hyperparameters(hparams)
-        # self.step_count = 0
+        self.step_count = 0
         self.output_dir = Path(self.hparams.output_dir)
         cache_dir = self.hparams.cache_dir if self.hparams.cache_dir else None
 
@@ -627,18 +647,11 @@ class TokenClassificationModule(pl.LightningModule):
         # for param in self.model.parameters():
         #     param.requires_grad = False
 
-    def _get_labels(self, path: str) -> List[str]:
-        with open(path, "r") as f:
-            labels = f.read().splitlines()
-        if "O" not in labels:
-            labels = ["O"] + labels
-        return labels
-
     def forward(self, **inputs):
         """ BertForTokenClassification.forward """
         return self.model(**inputs)
 
-    def training_step(self, train_batch: InputFeatures, batch_idx):
+    def training_step(self, train_batch: InputFeatures, batch_idx) -> Dict:
         """
         Training the data as batches and returns training loss on each batch
         :param train_batch Batch data
@@ -647,19 +660,20 @@ class TokenClassificationModule(pl.LightningModule):
         """
         # XLM and RoBERTa don"t use token_type_ids
         # if self.config.model_type != "distilbert":
-        # .to(self.device)
         inputs = {
-            "input_ids": train_batch.input_ids,
-            "attention_mask": train_batch.attention_mask,
-            "token_type_ids": train_batch.token_type_ids if self.config.model_type in ["bert", "xlnet"] else None,
-            "labels": train_batch.label_ids
+            "input_ids": train_batch.input_ids.to(self.device),
+            "attention_mask": train_batch.attention_mask.to(self.device),
+            "token_type_ids": train_batch.token_type_ids.to(self.device)
+            if self.config.model_type in ["bert", "xlnet"]
+            else None,
+            "labels": train_batch.label_ids.to(self.device),
         }
-        outputs: TokenClassifierOutput = self(**inputs)
-        loss = outputs[0]
+        output: TokenClassifierOutput = self(**inputs)
+        loss = output.loss
         self.log("train_loss", loss)
         return {"loss": loss}
 
-    def validation_step(self, val_batch: InputFeatures, batch_idx):
+    def validation_step(self, val_batch: InputFeatures, batch_idx) -> Dict:
         """
         Performs validation of data in batches
         :param val_batch: Batch data
@@ -668,27 +682,29 @@ class TokenClassificationModule(pl.LightningModule):
         """
         # XLM and RoBERTa don"t use token_type_ids
         # if self.config.model_type != "distilbert":
-        # .to(self.device)
         inputs = {
-            "input_ids": val_batch.input_ids,
-            "attention_mask": val_batch.attention_mask,
-            "token_type_ids": val_batch.token_type_ids if self.config.model_type in ["bert", "xlnet"] else None,
-            "labels": val_batch.label_ids
+            "input_ids": val_batch.input_ids.to(self.device),
+            "attention_mask": val_batch.attention_mask.to(self.device),
+            "token_type_ids": val_batch.token_type_ids.to(self.device)
+            if self.config.model_type in ["bert", "xlnet"]
+            else None,
+            "labels": val_batch.label_ids.to(self.device),
         }
-        outputs: TokenClassifierOutput = self(**inputs)
-        loss, logits = outputs[:2]
+        output: TokenClassifierOutput = self(**inputs)
+        loss, logits = output.loss, output.logits
         preds = logits.detach().cpu().numpy()
         target_ids = inputs["labels"].detach().cpu().numpy()
+        self.log("val_loss", loss)
         return {
             "val_loss": loss.detach().cpu(),
             "pred": preds,
             "target": target_ids,
         }
 
-    def test_step(self, test_batch: InputFeatures, batch_idx):
+    def test_step(self, test_batch: InputFeatures, batch_idx) -> Dict:
         return self.validation_step(test_batch, batch_idx)
 
-    def _eval_end(self, outputs):
+    def _eval_end(self, outputs: List[Dict]):
         val_loss_mean = torch.stack([x["val_loss"] for x in outputs]).mean()
 
         preds = np.concatenate([x["pred"] for x in outputs], axis=0)
@@ -715,7 +731,7 @@ class TokenClassificationModule(pl.LightningModule):
         ret["log"] = results
         return ret, preds_list, target_list
 
-    def validation_epoch_end(self, outputs):
+    def validation_epoch_end(self, outputs: List[Dict]) -> Dict:
         """
         Computes average validation loss
         :param outputs: outputs after every epoch end
@@ -726,9 +742,9 @@ class TokenClassificationModule(pl.LightningModule):
         logs = ret["log"]
         avg_loss = logs["val_loss"]
         self.log("val_loss", avg_loss, sync_dist=True)
-        return {"val_loss": avg_loss, "log": logs, "progress_bar": logs, sync_dist=True}
+        return {"val_loss": avg_loss, "log": logs, "progress_bar": logs}
 
-    def test_epoch_end(self, outputs):
+    def test_epoch_end(self, outputs: List[Dict]) -> Dict:
         """
         Computes average test metrics
         :param outputs: outputs after every epoch end
@@ -739,7 +755,14 @@ class TokenClassificationModule(pl.LightningModule):
         ret, _, _ = self._eval_end(outputs)
         # pytorch_lightning/trainer/logging.py#L139
         logs = ret["log"]
-        return {"test_accuracy": logs["accuracy_score"], "test_precision": logs["precision"], "test_recall": logs["recall"], "test_f1": logs["f1"], "log": logs, "progress_bar": logs}
+        return {
+            "test_accuracy": logs["accuracy_score"],
+            "test_precision": logs["precision"],
+            "test_recall": logs["recall"],
+            "test_f1": logs["f1"],
+            "log": logs,
+            "progress_bar": logs,
+        }
 
     def configure_optimizers(self):
         """Prepare optimizer and schedule (linear warmup and decay)"""
@@ -793,12 +816,12 @@ class TokenClassificationModule(pl.LightningModule):
 
         return [self.optimizer], [self.scheduler]
 
-    # @pl.utilities.rank_zero_only
-    # def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
-    #     save_path = self.output_dir.joinpath("best_tfmr")
-    #     self.model.config.save_step = self.step_count
-    #     self.model.save_pretrained(save_path)
-    #     self.tokenizer.save_pretrained(save_path)
+    @pl.utilities.rank_zero_only
+    def on_save_checkpoint(self, checkpoint: Dict[str, Any]):
+        save_path = self.output_dir.joinpath("best_tfmr")
+        self.model.config.save_step = self.step_count
+        self.model.save_pretrained(save_path)
+        self.tokenizer.save_pretrained(save_path)
 
     @staticmethod
     def add_model_specific_args(parent_parser, root_dir):
@@ -923,6 +946,7 @@ class LoggingCallback(pl.Callback):
                     rank_zero_info("{} = {}\n".format(key, str(metrics[key])))
                     writer.write("{} = {}\n".format(key, str(metrics[key])))
 
+
 def add_generic_args(parser, root_dir) -> None:
     #  To allow all pl args uncomment the following line
     #  parser = pl.Trainer.add_argparse_args(parser)
@@ -980,6 +1004,7 @@ def add_generic_args(parser, root_dir) -> None:
         help="The input data dir. Should contain the training files for the CoNLL-2003 NER task.",
     )
 
+
 def generic_train(
     model: TokenClassificationModule,
     args: Namespace,
@@ -1034,6 +1059,7 @@ def generic_train(
     )
 
     return trainer
+
 
 if __name__ == "__main__":
     parser = ArgumentParser()
