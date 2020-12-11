@@ -7,8 +7,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 from itertools import product, starmap
 from pathlib import Path
-from typing import Any, Final, List, Optional, Set, TextIO, Union
-from typing_extensions import TypedDict
+from typing import Any, Dict, Final, List, Optional, Set, TextIO, Union
+
+import tokenizations
 
 import numpy as np
 import pytorch_lightning as pl
@@ -28,7 +29,6 @@ from transformers import (
     BatchEncoding,
     PretrainedConfig,
     PreTrainedModel,
-    PreTrainedTokenizer,
     PreTrainedTokenizerFast,
 )
 from transformers.optimization import Adafactor
@@ -48,34 +48,69 @@ class Split(Enum):
     test = "test"
 
 
-class ExpectedAnnotationShape(TypedDict):
+@dataclass
+class SpanAnnotation:
     start: int
     end: int
     label: str
 
 
-class ExpectedDataItemShape(TypedDict):
-    content: str  # The Text to be annotated
-    annotations: List[ExpectedAnnotationShape]
+@dataclass
+class StringSpanExample:
+    guid: str
+    content: str
+    annotations: List[SpanAnnotation]
 
 
 @dataclass
-class InputExample:
-    """
-    A single training/test example for token classification.
-    Args:
-        guid: Unique id for the example.
-        words: list. The words of the sequence.
-        labels: (Optional) list. The labels for each word of the sequence. This should be
-        specified for train and dev examples, but not for test examples.
-    """
-
+class TokenLabelExample:
     guid: str
     words: List[str]
     labels: Optional[List[str]]
 
 
+@dataclass
+class InputFeatures:
+    input_ids: IntList
+    attention_mask: IntList
+    token_type_ids: Optional[IntList] = None
+    label_ids: Optional[IntList] = None
+
+
+# @dataclass
+# class InputFeaturesBatch:
+#     input_ids: torch.Tensor = field(init=False)
+#     attention_mask: torch.Tensor = field(init=False)
+#     token_type_ids: Optional[torch.Tensor] = field(init=False)
+#     label_ids: Optional[torch.Tensor] = field(init=False)
+
+#     def __getitem__(self, item):
+#         return getattr(self, item)
+
+#     def __post_init__(self, features: List[InputFeatures]):
+#         input_ids: IntListList = []
+#         masks: IntListList = []
+#         token_type_ids: IntListList = []
+#         label_ids: IntListList = []
+#         for f in features:
+#             input_ids.append(f.input_ids)
+#             masks.append(f.attention_mask)
+#             if f.token_type_ids is not None:
+#                 token_type_ids.append(f.token_type_ids)
+#             if f.label_ids is not None:
+#                 label_ids.append(f.label_ids)
+#         self.input_ids = torch.LongTensor(input_ids)
+#         self.attention_mask = torch.LongTensor(masks)
+#         if token_type_ids:
+#             self.token_type_ids = torch.LongTensor(token_type_ids)
+#         if label_ids:
+#             self.label_ids = torch.LongTensor(label_ids)
+
+
 def read_labels(path: str) -> StrList:
+    """
+    Read label definition data from file
+    """
     with open(path, "r") as f:
         labels = f.read().splitlines()
     if "O" not in labels:
@@ -88,9 +123,10 @@ def read_examples_from_file(
     mode: Union[Split, str],
     label_idx: int = -1,
     delimiter: str = " ",
-) -> List[InputExample]:
-    # TODO: InputExample -> ExpectedDataItemShape
-    # TokenData -> SpanData
+) -> List[TokenLabelExample]:
+    """
+    Read token-wise data like CoNLL2003 from file
+    """
     if isinstance(mode, Split):
         mode = mode.value
     file_path = os.path.join(data_dir, f"{mode}.txt")
@@ -103,7 +139,7 @@ def read_examples_from_file(
             if line.startswith("-DOCSTART-") or line == "" or line == "\n":
                 if words:
                     examples.append(
-                        InputExample(
+                        TokenLabelExample(
                             guid=f"{mode}-{guid_index}", words=words, labels=labels
                         )
                     )
@@ -120,55 +156,52 @@ def read_examples_from_file(
                     labels.append("O")
         if words:
             examples.append(
-                InputExample(guid=f"{mode}-{guid_index}", words=words, labels=labels)
+                TokenLabelExample(
+                    guid=f"{mode}-{guid_index}", words=words, labels=labels
+                )
             )
     return examples
 
 
-@dataclass
-class InputFeatures:
+def convert_spandata(examples: List[TokenLabelExample]) -> List[StringSpanExample]:
     """
-    A single set of features of data.
-    Property names are the same names as the corresponding inputs to a model.
+    Convert token-wise data like CoNLL2003 into string-wise span data
+    """
+    new_examples: List[StringSpanExample] = []
+    for example in examples:
+        words = example.words
+        text = "".join(words)
+        labels = example.labels
+        annotations = []
+        if labels:
+            word_spans = tokenizations.get_original_spans(words, text)
+            label_span = []
+            labeltype = ""
+            for span, label in zip(word_spans, labels):
+                if label == "O" and label_span and labeltype:
+                    start, end = label_span[0][0], label_span[-1][-1]
+                    anno = dict(start=start, end=end, label=labeltype)
+                    annotations.append(anno)
+                    label_span = []
+                else:
+                    labeltype = label.split("-")[1]
+                    label_span.append(span)
+            if label_span and labeltype:
+                start, end = label_span[0][0], label_span[-1][-1]
+                anno = dict(start=start, end=end, label=labeltype)
+                annotations.append(anno)
+
+        new_examples.append(
+            StringSpanExample(guid=example.guid, content=text, annotations=annotations)
+        )
+    return new_examples
+
+
+class LabelTokenAligner:
+    """
+    Align token-wise labels with subtokens
     """
 
-    input_ids: IntList
-    attention_mask: IntList
-    token_type_ids: Optional[IntList] = None
-    label_ids: Optional[IntList] = None
-
-
-@dataclass
-class InputFeaturesBatch:
-    input_ids: torch.Tensor = field(init=False)
-    attention_mask: torch.Tensor = field(init=False)
-    token_type_ids: Optional[torch.Tensor] = field(init=False)
-    label_ids: Optional[torch.Tensor] = field(init=False)
-
-    def __getitem__(self, item):
-        return getattr(self, item)
-
-    def __post_init__(self, features: List[InputFeatures]):
-        input_ids: IntListList = []
-        masks: IntListList = []
-        token_type_ids: IntListList = []
-        label_ids: IntListList = []
-        for f in features:
-            input_ids.append(f.input_ids)
-            masks.append(f.attention_mask)
-            if f.token_type_ids is not None:
-                token_type_ids.append(f.token_type_ids)
-            if f.label_ids is not None:
-                label_ids.append(f.label_ids)
-        self.input_ids = torch.LongTensor(input_ids)
-        self.attention_mask = torch.LongTensor(masks)
-        if token_type_ids:
-            self.token_type_ids = torch.LongTensor(token_type_ids)
-        if label_ids:
-            self.label_ids = torch.LongTensor(label_ids)
-
-
-class LabelSet:
     def __init__(self, labels: StrList):
         self.labels_to_id = {"O": 0}
         self.ids_to_label = {0: "O"}
@@ -179,7 +212,7 @@ class LabelSet:
 
     @staticmethod
     def align_tokens_and_annotations_bilou(
-        tokenized: Encoding, annotations: List[ExpectedAnnotationShape]
+        tokenized: Encoding, annotations: List[SpanAnnotation]
     ) -> StrList:
         aligned_labels = ["O"] * len(
             tokenized.tokens
@@ -188,7 +221,7 @@ class LabelSet:
             annotation_token_ix_set: Set[
                 int
             ] = set()  # A set that stores the token indices of the annotation
-            for char_ix in range(anno["start"], anno["end"]):
+            for char_ix in range(anno.start, anno.end):
                 token_ix = tokenized.char_to_token(char_ix)
                 if token_ix is not None:
                     annotation_token_ix_set.add(token_ix)
@@ -196,7 +229,7 @@ class LabelSet:
                 # If there is only one token
                 token_ix = annotation_token_ix_set.pop()
                 prefix = "U"  # This annotation spans one token so is prefixed with U for unique
-                aligned_labels[token_ix] = f"{prefix}-{anno['label']}"
+                aligned_labels[token_ix] = f"{prefix}-{anno.label}"
 
             else:
 
@@ -208,11 +241,11 @@ class LabelSet:
                         prefix = "L"  # Its the last token
                     else:
                         prefix = "I"  # We're inside of a multi token annotation
-                    aligned_labels[token_ix] = f"{prefix}-{anno['label']}"
+                    aligned_labels[token_ix] = f"{prefix}-{anno.label}"
         return aligned_labels
 
-    def get_aligned_label_ids_from_annotations(
-        self, tokenized_text: Encoding, annotations: List[ExpectedAnnotationShape]
+    def align_labels_with_tokens(
+        self, tokenized_text: Encoding, annotations: List[SpanAnnotation]
     ) -> IntList:
         # TODO: switch label encoding scheme, align_tokens_and_annotations_bio
         raw_labels = self.align_tokens_and_annotations_bilou(
@@ -222,40 +255,42 @@ class LabelSet:
 
 
 class NERDataset(Dataset):
+    """
+    Build feature dataset so that the model can load
+    """
+
     def __init__(
         self,
-        data: List[ExpectedDataItemShape],
-        label_set: LabelSet,
+        data: List[StringSpanExample],
+        label_token_aligner: LabelTokenAligner,
         tokenizer: PreTrainedTokenizerFast,
         tokens_per_batch: int = 32,
     ):
-        self.label_set = label_set
-        self.tokenizer = tokenizer
-        self.texts: StrList = []
-        self.annotations: List[List[ExpectedAnnotationShape]] = []
         self.training_examples: List[InputFeatures] = []
+
+        self.label_token_aligner = label_token_aligner
+        self.tokenizer = tokenizer
         pad_token_type_id = tokenizer.pad_token_type_id
         pad_token_id = tokenizer.pad_token_id
 
-        for example in data:
-            self.texts.append(example["content"])
-            self.annotations.append(example["annotations"])
+        self.texts: StrList = [ex.content for ex in data]
+        self.annotations: List[List[SpanAnnotation]] = [ex.annotations for ex in data]
 
         # TOKENIZATION INTO SUBWORD
-        # NOTE: add_special_tokens=True is unnecessary for NER
+        # NOTE: add_special_tokens=True is unnecessary for NER (ok?)
         tokenized_batch: BatchEncoding = self.tokenizer(
             self.texts, add_special_tokens=False
         )
         encodings: List[Encoding] = tokenized_batch.encodings
         # LABEL ALIGNMENT
-        aligned_labels: IntListList = list(
+        aligned_label_ids: IntListList = list(
             starmap(
-                label_set.get_aligned_label_ids_from_annotations,
+                label_token_aligner.align_labels_with_tokens,
                 zip(encodings, self.annotations),
             )
         )
-        # PADDING
-        for encoding, label_ids in zip(encodings, aligned_labels):
+        # PADDING & REGISTER FEATURES
+        for encoding, label_ids in zip(encodings, aligned_label_ids):
             seq_length = len(label_ids)
             for start in range(0, seq_length, tokens_per_batch):
                 end = min(start + tokens_per_batch, seq_length)
@@ -287,14 +322,18 @@ class NERDataset(Dataset):
 
 
 class TokenClassificationDataModule(pl.LightningDataModule):
+    """
+    Prepare dataset and build DataLoader
+    """
+
     def __init__(self, **kwargs):
-        """
-        Initialization of inherited lightning data module
-        """
         self.tokenizer: PreTrainedTokenizerFast
-        self.train_examples: List[InputExample]
-        self.dev_examples: List[InputExample]
-        self.test_examples: List[InputExample]
+        self.train_examples: List[TokenLabelExample]
+        self.dev_examples: List[TokenLabelExample]
+        self.test_examples: List[TokenLabelExample]
+        self.train_data: List[StringSpanExample]
+        self.dev_data: List[StringSpanExample]
+        self.test_data: List[StringSpanExample]
         self.train_dataset: NERDataset
         self.dev_dataset: NERDataset
         self.test_dataset: NERDataset
@@ -304,13 +343,14 @@ class TokenClassificationDataModule(pl.LightningDataModule):
         self.cache_dir = kwargs["cache_dir"]
         self.data_dir = kwargs["data_dir"]
         tn = kwargs["tokenizer_name"]
-        self.tokenizer_name = tn if tn else kwargs["model_name_or_path"]
+        model_type = kwargs["model_name_or_path"]
+        self.tokenizer_name = tn if tn else model_type
         self.train_batch_size = kwargs["train_batch_size"]
         self.eval_batch_size = kwargs["eval_batch_size"]
         self.num_workers = kwargs["num_workers"]
         self.labels = read_labels(kwargs["labels"])
-        self.label_set = LabelSet(self.labels)
-        # is_xlnet = bool(self.model_type in ["xlnet"])
+        self.label_token_aligner = LabelTokenAligner(self.labels)
+        # is_xlnet = bool(model_type in ["xlnet"])
 
     def prepare_data(self):
         """
@@ -324,38 +364,24 @@ class TokenClassificationDataModule(pl.LightningDataModule):
         self.train_examples = read_examples_from_file(self.data_dir, Split.train)
         self.dev_examples = read_examples_from_file(self.data_dir, Split.dev)
         self.test_examples = read_examples_from_file(self.data_dir, Split.test)
+        self.train_data = convert_spandata(self.train_examples)
+        self.dev_data = convert_spandata(self.dev_examples)
+        self.test_data = convert_spandata(self.test_examples)
+        self.train_dataset = self.get_dataset(self.train_data)
+        self.dev_dataset = self.get_dataset(self.dev_data)
+        self.test_dataset = self.get_dataset(self.test_data)
+
+    def get_dataset(self, data: List[StringSpanExample]):
+        return NERDataset(
+            data, self.label_token_aligner, self.tokenizer, self.max_seq_length
+        )
 
     def setup(self, stage=None):
         """
         split the data into train, test, validation data
-        :param stage: Stage - training or testing
+        but here we assume the dataset is splitted in prior
         """
-        # # NOTE: (fixed) np.random random_state is used by default
-        # train, test = train_test_split(
-        #     data, test_size=0.3, stratify=data[LABEL_COL_NAME]
-        # )
-        # dev, test = train_test_split(
-        #     test, test_size=0.5, stratify=test[LABEL_COL_NAME]
-        # )
         pass
-
-    @property
-    def train_dataset(self):
-        return NERDataset(
-            self.train_examples, self.label_set, self.tokenizer, self.max_seq_length
-        )
-
-    @property
-    def val_dataset(self):
-        return NERDataset(
-            self.dev_examples, self.label_set, self.tokenizer, self.max_seq_length
-        )
-
-    @property
-    def test_dataset(self):
-        return NERDataset(
-            self.test_examples, self.label_set, self.tokenizer, self.max_seq_length
-        )
 
     @property
     def train_dataloader(self):
@@ -470,8 +496,11 @@ class TokenClassificationDataModule(pl.LightningDataModule):
 
 
 class TokenClassificationModule(pl.LightningModule):
+    """
+    Initialize a model and config for token-classification
+    """
+
     def __init__(self, hparams):
-        """Initialize a model and config for token-classification"""
         if type(hparams) == dict:
             hparams = Namespace(**hparams)
 
@@ -483,21 +512,17 @@ class TokenClassificationModule(pl.LightningModule):
 
         super().__init__()
 
-        # TODO: move to self.save_hyperparameters()
-        # self.save_hyperparameters()
-        # can also expand arguments into trainer signature for easier reading
-
         self.save_hyperparameters(hparams)
         self.step_count = 0
         self.output_dir = Path(self.hparams.output_dir)
-        cache_dir = self.hparams.cache_dir if self.hparams.cache_dir else None
+        self.cache_dir = self.hparams.cache_dir if self.hparams.cache_dir else None
 
         self.config: PretrainedConfig = AutoConfig.from_pretrained(
             self.hparams.config_name
             if self.hparams.config_name
             else self.hparams.model_name_or_path,
             **({"num_labels": num_labels} if num_labels is not None else {}),
-            cache_dir=cache_dir,
+            cache_dir=self.cache_dir,
         )
         extra_model_params = (
             "encoder_layerdrop",
@@ -506,17 +531,17 @@ class TokenClassificationModule(pl.LightningModule):
             "attention_dropout",
         )
         for p in extra_model_params:
-            if getattr(self.hparams, p, None):
+            if a := getattr(self.hparams, p, None):
                 assert hasattr(
                     self.config, p
                 ), f"model config doesn't have a `{p}` attribute"
-                setattr(self.config, p, getattr(self.hparams, p))
+                setattr(self.config, p, a)
 
         self.model: PreTrainedModel = AutoModelForTokenClassification.from_pretrained(
             self.hparams.model_name_or_path,
             from_tf=bool(".ckpt" in self.hparams.model_name_or_path),
             config=self.config,
-            cache_dir=cache_dir,
+            cache_dir=self.cache_dir,
         )
         # for param in self.model.parameters():
         #     param.requires_grad = False
@@ -719,12 +744,6 @@ class TokenClassificationModule(pl.LightningModule):
             type=str,
             help="Pretrained config name or path if not the same as model_name",
         )
-        # parser.add_argument(
-        #     "--tokenizer_name",
-        #     default=None,
-        #     type=str,
-        #     help="Pretrained tokenizer name or path if not the same as model_name",
-        # )
         parser.add_argument(
             "--cache_dir",
             default="",
