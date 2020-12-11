@@ -10,3 +10,4 @@ seqeval
 pipdeptree
 requests
 typing-extensions
+pytokenizations
