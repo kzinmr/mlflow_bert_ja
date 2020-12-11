@@ -1,24 +1,27 @@
-import argparse
-import glob
 import logging
 import os
 from argparse import ArgumentParser, Namespace
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from itertools import product, starmap
 from pathlib import Path
 from typing import Any, Dict, Final, List, Optional, Set, TextIO, Union
 
-import tokenizations
-
+import mlflow.pytorch
 import numpy as np
 import pytorch_lightning as pl
+import tokenizations
 import torch
 
+from pytorch_lightning.callbacks import (
+    EarlyStopping,
+    ModelCheckpoint,
+    LearningRateMonitor,
+)
 from pytorch_lightning.utilities import rank_zero_info
 from seqeval.metrics import accuracy_score, f1_score, precision_score, recall_score
 from torch.nn import CrossEntropyLoss
-from torch.utils.data import DataLoader, Dataset, TensorDataset
+from torch.utils.data import DataLoader, Dataset
 
 from tokenizers import Encoding
 from transformers import (
@@ -431,8 +434,18 @@ class TokenClassificationDataModule(pl.LightningDataModule):
                     line.split()[0],
                 )
 
+    def total_steps(self) -> int:
+        """The number of total training steps that will be run. Used for lr scheduler purposes."""
+        num_devices = max(1, self.hparams.gpus)  # TODO: consider num_tpu_cores
+        effective_batch_size = (
+            self.hparams.train_batch_size
+            * self.hparams.accumulate_grad_batches
+            * num_devices
+        )
+        return (self.dataset_size / effective_batch_size) * self.hparams.max_epochs
+
     @staticmethod
-    def add_model_specific_args(parent_parser, root_dir):
+    def add_model_specific_args(parent_parser):
         """
         Returns the text and the labels of the specified item
         :param parent_parser: Application specific parser
@@ -723,7 +736,7 @@ class TokenClassificationModule(pl.LightningModule):
         self.tokenizer.save_pretrained(save_path)
 
     @staticmethod
-    def add_model_specific_args(parent_parser, root_dir):
+    def add_model_specific_args(parent_parser):
         """
         Returns the text and the label of the specified item
         :param parent_parser: Application specific parser
@@ -840,9 +853,8 @@ class LoggingCallback(pl.Callback):
                     writer.write("{} = {}\n".format(key, str(metrics[key])))
 
 
-def add_generic_args(parser, root_dir) -> None:
-    #  To allow all pl args uncomment the following line
-    #  parser = pl.Trainer.add_argparse_args(parser)
+def add_generic_args(parser):
+    parser = pl.Trainer.add_argparse_args(parent_parser=parser)
     parser.add_argument(
         "--output_dir",
         default=None,
@@ -851,40 +863,12 @@ def add_generic_args(parser, root_dir) -> None:
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument(
-        "--fp16",
-        action="store_true",
-        help="Whether to use 16-bit (mixed) precision (through NVIDIA apex) instead of 32-bit",
-    )
-
-    parser.add_argument(
-        "--fp16_opt_level",
-        type=str,
-        default="O2",
-        help="For fp16: Apex AMP optimization level selected in ['O0', 'O1', 'O2', and 'O3']."
-        "See details at https://nvidia.github.io/apex/amp.html",
-    )
-    parser.add_argument("--n_tpu_cores", dest="tpu_cores", type=int)
-    parser.add_argument(
-        "--max_grad_norm",
-        dest="gradient_clip_val",
-        default=1.0,
-        type=float,
-        help="Max gradient norm",
-    )
-    parser.add_argument(
         "--do_train", action="store_true", help="Whether to run training."
     )
     parser.add_argument(
         "--do_predict",
         action="store_true",
         help="Whether to run predictions on the test set.",
-    )
-    parser.add_argument(
-        "--gradient_accumulation_steps",
-        dest="accumulate_grad_batches",
-        type=int,
-        default=1,
-        help="Number of updates steps to accumulate before performing a backward/update pass.",
     )
     parser.add_argument(
         "--seed", type=int, default=42, help="random seed for initialization"
@@ -896,91 +880,97 @@ def add_generic_args(parser, root_dir) -> None:
         required=True,
         help="The input data dir. Should contain the training files for the CoNLL-2003 NER task.",
     )
+    parser.add_argument(
+        "--num_samples",
+        type=int,
+        default=15000,
+        metavar="N",
+        help="Number of samples to be used for training and evaluation steps (default: 15000) Maximum:100000",
+    )
+    parser.add_argument(
+        "--gradient_accumulation_steps",
+        dest="accumulate_grad_batches",
+        type=int,
+        default=1,
+        help="Number of updates steps to accumulate before performing a backward/update pass.",
+    )
 
 
-def generic_train(
-    model: TokenClassificationModule,
-    args: Namespace,
-    early_stopping_callback=None,
-    logger=True,  # can pass WandbLogger() here
-    extra_callbacks=[],
-    checkpoint_callback=None,
-    logging_callback=None,
-    **extra_train_kwargs,
-):
-    pl.seed_everything(args.seed)
+def make_trainer(parser):
+    """
+    Prepare pl.Trainer with callbacks and args
+    """
+    parser = TokenClassificationModule.add_model_specific_args(parent_parser=parser)
+    parser = TokenClassificationDataModule.add_model_specific_args(parent_parser=parser)
+    argparse_args = parser.parse_args()
 
-    # init model
-    odir = Path(model.hparams.output_dir)
-    odir.mkdir(exist_ok=True)
+    early_stopping = EarlyStopping(monitor="val_loss", mode="min", verbose=True)
 
-    # add custom checkpoints
-    if checkpoint_callback is None:
-        checkpoint_callback = pl.callbacks.ModelCheckpoint(
-            filepath=args.output_dir,
-            prefix="checkpoint",
-            monitor="val_loss",
-            mode="min",
-            save_top_k=1,
-        )
-    if early_stopping_callback:
-        extra_callbacks.append(early_stopping_callback)
-    if logging_callback is None:
-        logging_callback = LoggingCallback()
+    checkpoint_callback = ModelCheckpoint(
+        filepath=argparse_args.output_dir,
+        save_top_k=1,
+        verbose=True,
+        monitor="val_loss",
+        mode="min",
+        prefix="checkpoint",
+    )
+    lr_logger = LearningRateMonitor()
+    logging_callback = LoggingCallback()
 
     train_params = {}
-
-    # TODO: remove with PyTorch 1.6 since pl uses native amp
-    if args.fp16:
-        train_params["precision"] = 16
-        train_params["amp_level"] = args.fp16_opt_level
-
     if args.gpus > 1:
         train_params["distributed_backend"] = "ddp"
-
     train_params["accumulate_grad_batches"] = args.accumulate_grad_batches
-    train_params["accelerator"] = extra_train_kwargs.get("accelerator", None)
-    train_params["profiler"] = extra_train_kwargs.get("profiler", None)
 
     trainer = pl.Trainer.from_argparse_args(
-        args,
-        weights_summary=None,
-        callbacks=[logging_callback] + extra_callbacks,
-        logger=logger,
+        argparse_args,
+        callbacks=[lr_logger, early_stopping, logging_callback],
         checkpoint_callback=checkpoint_callback,
         **train_params,
     )
-
     return trainer
 
 
-if __name__ == "__main__":
-    parser = ArgumentParser()
-    add_generic_args(parser, os.getcwd())
-    parser = TokenClassificationModule.add_model_specific_args(parser, os.getcwd())
+def make_model_and_dm(parser):
+    """
+    Prepare pl.LightningDataModule and pl.LightningModule
+    """
+    parser = TokenClassificationModule.add_model_specific_args(parent_parser=parser)
+    parser = TokenClassificationDataModule.add_model_specific_args(parent_parser=parser)
     args = parser.parse_args()
 
-    # If output_dir not provided, a folder will be generated in pwd
-    if args.output_dir is None:
-        args.output_dir = os.path.join(
-            "./results",
-            f"{args.task}_{time.strftime('%Y%m%d_%H%M%S')}",
-        )
-        os.makedirs(args.output_dir)
+    dict_args = vars(args)
 
-    model = TokenClassificationModule(args)
-    trainer = generic_train(model, args)
+    dm = TokenClassificationDataModule(**dict_args)
+    dm.prepare_data()
+    dm.setup(stage="fit")
 
-    trainer.fit(model)
+    model = TokenClassificationModule(**dict_args)
+
+    return model, dm
+
+
+if __name__ == "__main__":
+
+    parser = ArgumentParser(description="Transformers Token Classifier")
+    add_generic_args(parser)
+    args = parser.parse_args()
+
+    # init
+    pl.seed_everything(args.seed)
+    Path(args.output_dir).mkdir(exist_ok=True)
+
+    mlflow.pytorch.autolog()
+
+    model, dm = make_model_and_dm(parser)
+    trainer = make_trainer(parser)
+
+    # MLflow Autologging is performed here
+    trainer.fit(model, dm)
 
     if args.do_predict:
         checkpoints = list(
-            sorted(
-                glob.glob(
-                    os.path.join(args.output_dir, "checkpoint-epoch=*.ckpt"),
-                    recursive=True,
-                )
-            )
+            sorted(Path(args.output_dir).glob("**/checkpoint-epoch=*.ckpt"))
         )
         model = model.load_from_checkpoint(checkpoints[-1])
         trainer.test(model)
