@@ -421,7 +421,7 @@ class TokenClassificationDataModule(pl.LightningDataModule):
     Prepare dataset and build DataLoader
     """
 
-    def __init__(self, **kwargs):
+    def __init__(self, hparams):
         self.tokenizer: PreTrainedTokenizerFast
         self.train_examples: List[TokenLabelExample]
         self.dev_examples: List[TokenLabelExample]
@@ -433,17 +433,20 @@ class TokenClassificationDataModule(pl.LightningDataModule):
         self.dev_dataset: NERDataset
         self.test_dataset: NERDataset
 
+        if type(hparams) == dict:
+            hparams = Namespace(**hparams)
         super().__init__()
-        self.max_seq_length = kwargs["max_seq_length"]
-        self.cache_dir = kwargs["cache_dir"]
-        self.data_dir = kwargs["data_dir"]
-        tn = kwargs["tokenizer_name"]
-        model_type = kwargs["model_name_or_path"]
+        self.max_seq_length = hparams.max_seq_length
+        self.cache_dir = hparams.cache_dir
+        self.data_dir = hparams.data_dir
+        tn = hparams.tokenizer_name
+        model_type = hparams.model_name_or_path
         self.tokenizer_name = tn if tn else model_type
-        self.train_batch_size = kwargs["train_batch_size"]
-        self.eval_batch_size = kwargs["eval_batch_size"]
-        self.num_workers = kwargs["num_workers"]
-        self.labels_path = kwargs["labels"]
+        self.train_batch_size = hparams.train_batch_size
+        self.eval_batch_size = hparams.eval_batch_size
+        self.num_workers = hparams.num_workers
+        self.labels_path = hparams.labels
+        self.num_samples = hparams.num_samples
         # is_xlnet = bool(model_type in ["xlnet"])
 
     def prepare_data(self):
@@ -460,6 +463,10 @@ class TokenClassificationDataModule(pl.LightningDataModule):
         self.train_examples = read_examples_from_file(self.data_dir, Split.train)
         self.dev_examples = read_examples_from_file(self.data_dir, Split.dev)
         self.test_examples = read_examples_from_file(self.data_dir, Split.test)
+        if self.num_samples > 0:
+            self.train_examples = self.train_examples[:self.num_samples]
+            self.dev_examples = self.dev_examples[:self.num_samples]
+            self.test_examples = self.test_examples[:self.num_samples]
         self.train_data = convert_spandata(self.train_examples)
         self.dev_data = convert_spandata(self.dev_examples)
         self.test_data = convert_spandata(self.test_examples)
@@ -606,13 +613,6 @@ class TokenClassificationDataModule(pl.LightningDataModule):
             help="Path to a file containing all labels. If not specified, CoNLL-2003 labels are used.",
         )
         parser.add_argument(
-            "--model_name_or_path",
-            default=PRETRAINED_MODEL,
-            type=str,
-            required=True,
-            help="(Common)Path to pretrained model or model identifier from huggingface.co/models",
-        )
-        parser.add_argument(
             "--tokenizer_name",
             default=None,
             type=str,
@@ -620,10 +620,17 @@ class TokenClassificationDataModule(pl.LightningDataModule):
         )
         parser.add_argument(
             "--data_dir",
-            default="ner_data",
+            default="data",
             type=str,
             required=True,
             help="The input data dir. Should contain the training files for the CoNLL-2003 NER task.",
+        )
+        parser.add_argument(
+            "--num_samples",
+            type=int,
+            default=0,
+            metavar="N",
+            help="Number of samples to be used for training and evaluation steps (default: 15000) Maximum:100000",
         )
         return parser
 
@@ -648,7 +655,11 @@ class TokenClassificationModule(pl.LightningModule):
         self.save_hyperparameters(hparams)
         self.step_count = 0
         self.output_dir = Path(self.hparams.output_dir)
-        self.cache_dir = self.hparams.cache_dir if self.hparams.cache_dir else None
+        self.cache_dir = None
+        if self.hparams.cache_dir:
+            if not os.path.exists(self.hparams.cache_dir):
+                os.mkdir(self.hparams.cache_dir)
+            self.cache_dir = self.hparams.cache_dir
 
         # AutoConfig
         self.config: PretrainedConfig = BertConfig.from_pretrained(
@@ -828,7 +839,6 @@ class TokenClassificationModule(pl.LightningModule):
                 scale_parameter=False,
                 relative_step=False,
             )
-
         else:
             optimizer = AdamW(
                 optimizer_grouped_parameters,
@@ -868,23 +878,10 @@ class TokenClassificationModule(pl.LightningModule):
         parser = ArgumentParser(parents=[parent_parser], add_help=False)
 
         parser.add_argument(
-            "--model_name_or_path",
-            default=PRETRAINED_MODEL,
-            type=str,
-            required=True,
-            help="Path to pretrained model or model identifier from huggingface.co/models",
-        )
-        parser.add_argument(
             "--config_name",
             default=None,
             type=str,
             help="Pretrained config name or path if not the same as model_name",
-        )
-        parser.add_argument(
-            "--cache_dir",
-            default="",
-            type=str,
-            help="Where do you want to store the pre-trained models downloaded from huggingface.co",
         )
         parser.add_argument(
             "--encoder_layerdrop",
@@ -931,9 +928,6 @@ class TokenClassificationModule(pl.LightningModule):
             help="Linear warmup over warmup_steps.",
         )
         parser.add_argument(
-            "--num_workers", default=4, type=int, help="kwarg passed to DataLoader"
-        )
-        parser.add_argument(
             "--num_train_epochs", dest="max_epochs", default=3, type=int
         )
 
@@ -976,7 +970,7 @@ class LoggingCallback(pl.Callback):
                     writer.write("{} = {}\n".format(key, str(metrics[key])))
 
 
-def add_generic_args(parser):
+def add_common_args(parser):
     parser = pl.Trainer.add_argparse_args(parent_parser=parser)
     parser.add_argument(
         "--output_dir",
@@ -997,27 +991,25 @@ def add_generic_args(parser):
         "--seed", type=int, default=42, help="random seed for initialization"
     )
     parser.add_argument(
-        "--data_dir",
-        default=None,
-        type=str,
-        required=True,
-        help="The input data dir. Should contain the training files for the CoNLL-2003 NER task.",
-    )
-    parser.add_argument(
-        "--num_samples",
-        type=int,
-        default=15000,
-        metavar="N",
-        help="Number of samples to be used for training and evaluation steps (default: 15000) Maximum:100000",
-    )
-    parser.add_argument(
         "--gradient_accumulation_steps",
         dest="accumulate_grad_batches",
         type=int,
         default=1,
         help="Number of updates steps to accumulate before performing a backward/update pass.",
     )
-
+    parser.add_argument(
+        "--model_name_or_path",
+        default=PRETRAINED_MODEL,
+        type=str,
+        required=True,
+        help="(Common)Path to pretrained model or model identifier from huggingface.co/models",
+    )
+    parser.add_argument(
+        "--cache_dir",
+        default="cache",
+        type=str,
+        help="Where do you want to store the pre-trained models downloaded from huggingface.co",
+    )
 
 def make_trainer(parser):
     """
@@ -1066,7 +1058,7 @@ def make_model_and_dm(parser):
     dm = TokenClassificationDataModule(**dict_args)
     dm.prepare_data()
     dm.setup(stage="fit")
-    # DataModule must be loaded first, because labels.biolu is automatically generated
+    # DataModule must be loaded first, because label_types.txt is automatically generated
     model = TokenClassificationModule(**dict_args)
 
     return model, dm
@@ -1075,7 +1067,7 @@ def make_model_and_dm(parser):
 if __name__ == "__main__":
 
     parser = ArgumentParser(description="Transformers Token Classifier")
-    add_generic_args(parser)
+    add_common_args(parser)
     args = parser.parse_args()
 
     # init
