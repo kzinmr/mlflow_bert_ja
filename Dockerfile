@@ -61,5 +61,5 @@ COPY *.sh ./
 # RUN mkdir -p outputs/data
 # RUN mkdir -p outputs/models
 
-CMD ["python3", "app.py"]
+CMD ["run_ner_refactor.sh"]
 # , "--gpus", "1"]
