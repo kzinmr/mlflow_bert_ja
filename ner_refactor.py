@@ -11,7 +11,6 @@ from typing import Any, Dict, Final, List, Optional, Set, TextIO, Union
 import mlflow.pytorch
 import numpy as np
 import pytorch_lightning as pl
-import tokenizations
 import torch
 
 from pytorch_lightning.callbacks import (
@@ -27,9 +26,12 @@ from torch.utils.data import DataLoader, Dataset
 from tokenizers import Encoding
 from transformers import (
     AdamW,
-    AutoConfig,
-    AutoModelForTokenClassification,
-    AutoTokenizer,
+    # AutoConfig,
+    # AutoModelForTokenClassification,
+    # AutoTokenizer,
+    BertConfig,
+    BertForTokenClassification,
+    BertTokenizerFast,
     BatchEncoding,
     PretrainedConfig,
     PreTrainedModel,
@@ -37,9 +39,11 @@ from transformers import (
 )
 from transformers.optimization import Adafactor
 from transformers.modeling_outputs import TokenClassifierOutput
+import requests
 
 
 logger = logging.getLogger(__name__)
+PRETRAINED_MODEL: Final[str] = 'cl-tohoku/bert-base-japanese'
 PAD_TOKEN_LABEL_ID: Final[int] = CrossEntropyLoss().ignore_index
 IntList = List[int]
 IntListList = List[IntList]
@@ -81,17 +85,16 @@ class InputFeatures:
     label_ids: Optional[IntList] = None
 
 
-@dataclass
 class InputFeaturesBatch:
-    input_ids: torch.Tensor = field(init=False)
-    attention_mask: torch.Tensor = field(init=False)
-    token_type_ids: Optional[torch.Tensor] = field(init=False)
-    label_ids: Optional[torch.Tensor] = field(init=False)
-
     def __getitem__(self, item):
         return getattr(self, item)
 
-    def __post_init__(self, features: List[InputFeatures]):
+    def __init__(self, features: List[InputFeatures]):
+        self.input_ids: torch.Tensor
+        self.attention_masks: torch.Tensor
+        self.token_type_ids: Optional[torch.Tensor]
+        self.labels: Optional[torch.Tensor]
+
         input_ids: IntListList = []
         masks: IntListList = []
         token_type_ids: IntListList = []
@@ -111,22 +114,84 @@ class InputFeaturesBatch:
             self.label_ids = torch.LongTensor(label_ids)
 
 
-def read_labels(path: str) -> StrList:
-    """
-    Read label definition data from file
-    """
-    with open(path, "r") as f:
-        labels = f.read().splitlines()
-    if "O" not in labels:
-        labels = ["O"] + labels
-    return labels
+def download_dataset(data_dir: str):
+    def _download_data(url, file_path):
+        response = requests.get(url)
+        if response.ok:
+            with open(file_path, "w") as fp:
+                fp.write(response.content.decode("utf8"))
+            return file_path
+
+    for mode in Split:
+        mode = mode.value
+        url = f"https://github.com/megagonlabs/UD_Japanese-GSD/releases/download/v2.6-NE/{mode}.bio"
+        file_path = os.path.join(data_dir, f"{mode}.txt")
+        if _download_data(url, file_path):
+            logger.info(f"{mode} data is successfully downloaded")
+
+
+def is_boundary_line(line: str) -> bool:
+    return line.startswith("-DOCSTART-") or line == "" or line == "\n"
+
+
+def bio2biolu(lines: StrList, label_idx: int = -1, delimiter: str = "\t") -> StrList:
+    new_lines = []
+    n_lines = len(lines)
+    for i, line in enumerate(lines):
+        if is_boundary_line(line):
+            new_lines.append(line)
+        else:
+            prev_iob = None
+            next_iob = None
+            if i > 0:
+                prev_line = lines[i - 1].strip()
+                if not is_boundary_line(prev_line):
+                    prev_iob = prev_line.split(delimiter)[label_idx][0]
+            if i < n_lines - 1:
+                next_line = lines[i + 1].strip()
+                if not is_boundary_line(next_line):
+                    next_iob = next_line.split(delimiter)[label_idx][0]
+
+            line = line.strip()
+            current_line_content = line.split(delimiter)
+            current_label = current_line_content[label_idx]
+            word = current_line_content[0]
+            tag_type = current_label[2:]
+            iob = current_label[0]
+
+            # O -> O
+            # (*,B,I) -> B
+            # (*,B,O)|(*,B,B)(*,B,None) -> U
+            # (*,I,I) -> I
+            # (*I,B)(*,I,O)(*,I,None) -> L
+            tpl = (prev_iob, iob, next_iob)
+            current_iob = iob
+            if tpl[1:] == ("B", "I"):
+                current_iob = "B"
+            elif tpl[1:] == ("I", "I"):
+                current_iob = "I"
+            elif tpl[1:] in {("B", "O"), ("B", "B"), ("B", None)}:
+                current_iob = "U"
+            elif tpl[1:] in {("I", "B"), ("I", "O"), ("I", None)}:
+                current_iob = "L"
+            elif iob == "O":
+                current_iob = "O"
+            else:
+                logger.warning(f"Invalid BIO transition: {tpl}")
+                if iob not in set("BIOLU"):
+                    current_iob = "O"
+            biolu = f"{current_iob}-{tag_type}" if current_iob != "O" else "O"
+            new_line = f"{word}{delimiter}{biolu}"
+            new_lines.append(new_line)
+    return new_lines
 
 
 def read_examples_from_file(
     data_dir: str,
     mode: Union[Split, str],
     label_idx: int = -1,
-    delimiter: str = " ",
+    delimiter: str = "\t",
+    is_bio: bool = True,
 ) -> List[TokenLabelExample]:
     """
     Read token-wise data like CoNLL2003 from file
@@ -137,10 +202,13 @@ def read_examples_from_file(
     guid_index = 1
     examples = []
     with open(file_path, encoding="utf-8") as f:
+        lines = [line for line in f]
+        if is_bio:
+            lines = bio2biolu(lines)
         words = []
         labels = []
-        for line in f:
-            if line.startswith("-DOCSTART-") or line == "" or line == "\n":
+        for line in lines:
+            if is_boundary_line(line):
                 if words:
                     examples.append(
                         TokenLabelExample(
@@ -171,29 +239,41 @@ def convert_spandata(examples: List[TokenLabelExample]) -> List[StringSpanExampl
     """
     Convert token-wise data like CoNLL2003 into string-wise span data
     """
+
+    def _get_original_spans(words, text):
+        word_spans = []
+        start = 0
+        for w in words:
+            word_spans.append((start, start + len(w)))
+            start += len(w)
+        assert words == [text[s:e] for s, e in word_spans]
+        return word_spans
+
     new_examples: List[StringSpanExample] = []
     for example in examples:
         words = example.words
         text = "".join(words)
         labels = example.labels
-        annotations = []
+        annotations: List[SpanAnnotation] = []
         if labels:
-            word_spans = tokenizations.get_original_spans(words, text)
+            word_spans = _get_original_spans(words, text)
             label_span = []
             labeltype = ""
             for span, label in zip(word_spans, labels):
                 if label == "O" and label_span and labeltype:
                     start, end = label_span[0][0], label_span[-1][-1]
-                    anno = dict(start=start, end=end, label=labeltype)
-                    annotations.append(anno)
+                    annotations.append(
+                        SpanAnnotation(start=start, end=end, label=labeltype)
+                    )
                     label_span = []
-                else:
-                    labeltype = label.split("-")[1]
+                elif label != "O":
+                    labeltype = label[2:]
                     label_span.append(span)
             if label_span and labeltype:
                 start, end = label_span[0][0], label_span[-1][-1]
-                anno = dict(start=start, end=end, label=labeltype)
-                annotations.append(anno)
+                annotations.append(
+                    SpanAnnotation(start=start, end=end, label=labeltype)
+                )
 
         new_examples.append(
             StringSpanExample(guid=example.guid, content=text, annotations=annotations)
@@ -206,7 +286,10 @@ class LabelTokenAligner:
     Align token-wise labels with subtokens
     """
 
-    def __init__(self, labels: StrList):
+    def __init__(self, labels_path: str):
+        with open(labels_path, "r") as f:
+            labels = [l for l in f.read().splitlines() if l and l != "O"]
+
         self.labels_to_id = {"O": 0}
         self.ids_to_label = {0: "O"}
         for i, (label, s) in enumerate(product(labels, "BILU"), 1):
@@ -270,13 +353,15 @@ class NERDataset(Dataset):
         tokenizer: PreTrainedTokenizerFast,
         tokens_per_batch: int = 32,
     ):
-        self.training_examples: List[InputFeatures] = []
+        self.features: List[InputFeatures] = []
+        self.examples: List[TokenLabelExample] = []
 
         self.label_token_aligner = label_token_aligner
         self.tokenizer = tokenizer
         pad_token_type_id = tokenizer.pad_token_type_id
         pad_token_id = tokenizer.pad_token_id
 
+        self.guids: StrList = [ex.guid for ex in data]
         self.texts: StrList = [ex.content for ex in data]
         self.annotations: List[List[SpanAnnotation]] = [ex.annotations for ex in data]
 
@@ -294,12 +379,12 @@ class NERDataset(Dataset):
             )
         )
         # PADDING & REGISTER FEATURES
-        for encoding, label_ids in zip(encodings, aligned_label_ids):
+        for guid, encoding, label_ids in zip(self.guids, encodings, aligned_label_ids):
             seq_length = len(label_ids)
             for start in range(0, seq_length, tokens_per_batch):
                 end = min(start + tokens_per_batch, seq_length)
                 n_padding_to_add = max(0, tokens_per_batch - end + start)
-                self.training_examples.append(
+                self.features.append(
                     InputFeatures(
                         input_ids=encoding.ids[start:end]
                         + [pad_token_id] * n_padding_to_add,
@@ -316,13 +401,19 @@ class NERDataset(Dataset):
                         ),
                     )
                 )
+                subwords = encoding.tokens[start:end]
+                labels = [
+                    label_token_aligner.ids_to_label[i] for i in label_ids[start:end]
+                ]
+                self.examples.append(
+                    TokenLabelExample(guid=guid, words=subwords, labels=labels)
+                )
 
     def __len__(self):
-        return len(self.training_examples)
+        return len(self.features)
 
     def __getitem__(self, idx) -> InputFeatures:
-
-        return self.training_examples[idx]
+        return self.features[idx]
 
 
 class TokenClassificationDataModule(pl.LightningDataModule):
@@ -352,8 +443,7 @@ class TokenClassificationDataModule(pl.LightningDataModule):
         self.train_batch_size = kwargs["train_batch_size"]
         self.eval_batch_size = kwargs["eval_batch_size"]
         self.num_workers = kwargs["num_workers"]
-        self.labels = read_labels(kwargs["labels"])
-        self.label_token_aligner = LabelTokenAligner(self.labels)
+        self.labels_path = kwargs["labels"]
         # is_xlnet = bool(model_type in ["xlnet"])
 
     def prepare_data(self):
@@ -361,23 +451,43 @@ class TokenClassificationDataModule(pl.LightningDataModule):
         Downloads the data and prepare the tokenizer
         """
         # trf>=4.0.0: PreTrainedTokenizerFast by default
-        self.tokenizer = AutoTokenizer.from_pretrained(
+        # NOTE: AutoTokenizer doesn't load PreTrainedTokenizerFast...
+        self.tokenizer = BertTokenizerFast.from_pretrained(
             self.tokenizer_name,
             cache_dir=self.cache_dir,
         )
+        download_dataset(self.data_dir)
         self.train_examples = read_examples_from_file(self.data_dir, Split.train)
         self.dev_examples = read_examples_from_file(self.data_dir, Split.dev)
         self.test_examples = read_examples_from_file(self.data_dir, Split.test)
         self.train_data = convert_spandata(self.train_examples)
         self.dev_data = convert_spandata(self.dev_examples)
         self.test_data = convert_spandata(self.test_examples)
+
+        if not os.path.exists(self.labels_path):
+            all_labels = set()
+            for ex in self.train_examples:
+                for l in ex.labels:
+                    all_labels.add(l)
+            for ex in self.dev_examples:
+                for l in ex.labels:
+                    all_labels.add(l)
+            for ex in self.test_examples:
+                for l in ex.labels:
+                    all_labels.add(l)
+            label_types = sorted({l[2:] for l in sorted(all_labels) if l != "O"})
+            with open(self.labels_path, "w") as fp:
+                fp.write("\n".join(label_types))
+        self.label_token_aligner = LabelTokenAligner(self.labels_path)
+
         self.train_dataset = self.get_dataset(self.train_data)
         self.dev_dataset = self.get_dataset(self.dev_data)
         self.test_dataset = self.get_dataset(self.test_data)
 
     def get_dataset(self, data: List[StringSpanExample]):
         return NERDataset(
-            data, self.label_token_aligner, self.tokenizer, self.max_seq_length
+            data, self.label_token_aligner, self.tokenizer, self.max_seq_length,
+            # pin_memory=True
         )
 
     def setup(self, stage=None):
@@ -387,12 +497,12 @@ class TokenClassificationDataModule(pl.LightningDataModule):
         """
         pass
 
-    def get_dataloader(self, ds: NERDataset, bs: int, shuffle: bool) -> DataLoader:
+    def get_dataloader(self, ds: NERDataset, bs: int, num_workers: int=0, shuffle: bool=False) -> DataLoader:
         return DataLoader(
             ds,
             collate_fn=InputFeaturesBatch,
             batch_size=bs,
-            num_workers=self.num_workers,
+            num_workers=num_workers,
             shuffle=shuffle,
         )
 
@@ -401,6 +511,7 @@ class TokenClassificationDataModule(pl.LightningDataModule):
         return self.get_dataloader(
             self.train_dataset,
             self.train_batch_size,
+            num_workers=self.num_workers,
             shuffle=True,
         )
 
@@ -409,7 +520,8 @@ class TokenClassificationDataModule(pl.LightningDataModule):
         return self.get_dataloader(
             self.dev_dataset,
             self.eval_batch_size,
-            shuffle=True,
+            num_workers=self.num_workers,
+            shuffle=False,
         )
 
     @property
@@ -417,7 +529,8 @@ class TokenClassificationDataModule(pl.LightningDataModule):
         return self.get_dataloader(
             self.test_dataset,
             self.eval_batch_size,
-            shuffle=True,
+            num_workers=self.num_workers,
+            shuffle=False,
         )
 
     @staticmethod
@@ -494,7 +607,7 @@ class TokenClassificationDataModule(pl.LightningDataModule):
         )
         parser.add_argument(
             "--model_name_or_path",
-            default=None,
+            default=PRETRAINED_MODEL,
             type=str,
             required=True,
             help="(Common)Path to pretrained model or model identifier from huggingface.co/models",
@@ -524,9 +637,9 @@ class TokenClassificationModule(pl.LightningModule):
         if type(hparams) == dict:
             hparams = Namespace(**hparams)
 
-        labels = read_labels(hparams.labels)
-        num_labels = len(labels)
-        self.label_map = {i: label for i, label in enumerate(labels)}
+        label_token_aligner = LabelTokenAligner(hparams.labels)
+        self.label_map = label_token_aligner.labels_to_id
+        num_labels = len(self.label_map)
         self.scheduler = None
         self.optimizer = None
 
@@ -537,7 +650,8 @@ class TokenClassificationModule(pl.LightningModule):
         self.output_dir = Path(self.hparams.output_dir)
         self.cache_dir = self.hparams.cache_dir if self.hparams.cache_dir else None
 
-        self.config: PretrainedConfig = AutoConfig.from_pretrained(
+        # AutoConfig
+        self.config: PretrainedConfig = BertConfig.from_pretrained(
             self.hparams.config_name
             if self.hparams.config_name
             else self.hparams.model_name_or_path,
@@ -551,13 +665,13 @@ class TokenClassificationModule(pl.LightningModule):
             "attention_dropout",
         )
         for p in extra_model_params:
-            if a := getattr(self.hparams, p, None):
+            if getattr(self.hparams, p, None):
                 assert hasattr(
                     self.config, p
                 ), f"model config doesn't have a `{p}` attribute"
-                setattr(self.config, p, a)
-
-        self.model: PreTrainedModel = AutoModelForTokenClassification.from_pretrained(
+                setattr(self.config, p, getattr(self.hparams, p, None))
+        # AutoModelForTokenClassification
+        self.model: PreTrainedModel = BertForTokenClassification.from_pretrained(
             self.hparams.model_name_or_path,
             from_tf=bool(".ckpt" in self.hparams.model_name_or_path),
             config=self.config,
@@ -579,13 +693,14 @@ class TokenClassificationModule(pl.LightningModule):
         """
         # XLM and RoBERTa don"t use token_type_ids
         # if self.config.model_type != "distilbert":
+        # .to(self.device) is not necessary with pl.Traner
         inputs = {
-            "input_ids": train_batch.input_ids.to(self.device),
-            "attention_mask": train_batch.attention_mask.to(self.device),
-            "token_type_ids": train_batch.token_type_ids.to(self.device)
+            "input_ids": train_batch.input_ids,
+            "attention_mask": train_batch.attention_mask,
+            "token_type_ids": train_batch.token_type_ids
             if self.config.model_type in ["bert", "xlnet"]
             else None,
-            "labels": train_batch.label_ids.to(self.device),
+            "labels": train_batch.label_ids,
         }
         output: TokenClassifierOutput = self(**inputs)
         loss = output.loss
@@ -601,13 +716,14 @@ class TokenClassificationModule(pl.LightningModule):
         """
         # XLM and RoBERTa don"t use token_type_ids
         # if self.config.model_type != "distilbert":
+        # .to(self.device) is not necessary with pl.Traner
         inputs = {
-            "input_ids": val_batch.input_ids.to(self.device),
-            "attention_mask": val_batch.attention_mask.to(self.device),
-            "token_type_ids": val_batch.token_type_ids.to(self.device)
+            "input_ids": val_batch.input_ids,
+            "attention_mask": val_batch.attention_mask,
+            "token_type_ids": val_batch.token_type_ids
             if self.config.model_type in ["bert", "xlnet"]
             else None,
-            "labels": val_batch.label_ids.to(self.device),
+            "labels": val_batch.label_ids,
         }
         output: TokenClassifierOutput = self(**inputs)
         loss, logits = output.loss, output.logits
@@ -753,14 +869,14 @@ class TokenClassificationModule(pl.LightningModule):
 
         parser.add_argument(
             "--model_name_or_path",
-            default=None,
+            default=PRETRAINED_MODEL,
             type=str,
             required=True,
             help="Path to pretrained model or model identifier from huggingface.co/models",
         )
         parser.add_argument(
             "--config_name",
-            default="",
+            default=None,
             type=str,
             help="Pretrained config name or path if not the same as model_name",
         )
@@ -945,13 +1061,12 @@ def make_model_and_dm(parser):
     parser = TokenClassificationModule.add_model_specific_args(parent_parser=parser)
     parser = TokenClassificationDataModule.add_model_specific_args(parent_parser=parser)
     args = parser.parse_args()
-
     dict_args = vars(args)
 
     dm = TokenClassificationDataModule(**dict_args)
     dm.prepare_data()
     dm.setup(stage="fit")
-
+    # DataModule must be loaded first, because labels.biolu is automatically generated
     model = TokenClassificationModule(**dict_args)
 
     return model, dm
