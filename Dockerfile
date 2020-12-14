@@ -61,5 +61,5 @@ COPY *.sh ./
 # RUN mkdir -p outputs/data
 # RUN mkdir -p outputs/models
 
-CMD ["run_ner_refactor.sh"]
+CMD ["bash", "./run_ner_refactor.sh"]
 # , "--gpus", "1"]

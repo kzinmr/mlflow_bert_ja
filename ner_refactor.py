@@ -2,11 +2,11 @@ import logging
 import os
 import random
 from argparse import ArgumentParser, Namespace
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from itertools import product, starmap
 from pathlib import Path
-from typing import Any, Dict, Final, List, Optional, Set, TextIO, Union
+from typing import Any, Dict, List, Optional, Set, TextIO, Union
 
 import mlflow.pytorch
 import numpy as np
@@ -20,7 +20,9 @@ from pytorch_lightning.callbacks import (
 )
 from pytorch_lightning.utilities import rank_zero_info
 from seqeval.metrics import accuracy_score, f1_score, precision_score, recall_score
+from seqeval.scheme import BILOU
 from torch.nn import CrossEntropyLoss
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Dataset
 
 from tokenizers import Encoding
@@ -43,12 +45,11 @@ import requests
 
 
 logger = logging.getLogger(__name__)
-PRETRAINED_MODEL: Final[str] = 'cl-tohoku/bert-base-japanese'
-PAD_TOKEN_LABEL_ID: Final[int] = CrossEntropyLoss().ignore_index
+PAD_TOKEN_LABEL_ID = CrossEntropyLoss().ignore_index
 IntList = List[int]
 IntListList = List[IntList]
 StrList = List[str]
-
+StrListList = List[StrList]
 
 class Split(Enum):
     train = "train"
@@ -86,8 +87,6 @@ class InputFeatures:
 
 
 class InputFeaturesBatch:
-    def __getitem__(self, item):
-        return getattr(self, item)
 
     def __init__(self, features: List[InputFeatures]):
         self.input_ids: torch.Tensor
@@ -95,6 +94,7 @@ class InputFeaturesBatch:
         self.token_type_ids: Optional[torch.Tensor]
         self.labels: Optional[torch.Tensor]
 
+        self.n_features = len(features)
         input_ids: IntListList = []
         masks: IntListList = []
         token_type_ids: IntListList = []
@@ -113,6 +113,11 @@ class InputFeaturesBatch:
         if label_ids:
             self.label_ids = torch.LongTensor(label_ids)
 
+    def __len__(self):
+        return self.n_features
+
+    def __getitem__(self, item):
+        return getattr(self, item)
 
 def download_dataset(data_dir: str):
     def _download_data(url, file_path):
@@ -421,7 +426,7 @@ class TokenClassificationDataModule(pl.LightningDataModule):
     Prepare dataset and build DataLoader
     """
 
-    def __init__(self, hparams):
+    def __init__(self, hparams: Namespace):
         self.tokenizer: PreTrainedTokenizerFast
         self.train_examples: List[TokenLabelExample]
         self.dev_examples: List[TokenLabelExample]
@@ -433,12 +438,14 @@ class TokenClassificationDataModule(pl.LightningDataModule):
         self.dev_dataset: NERDataset
         self.test_dataset: NERDataset
 
-        if type(hparams) == dict:
-            hparams = Namespace(**hparams)
         super().__init__()
         self.max_seq_length = hparams.max_seq_length
         self.cache_dir = hparams.cache_dir
+        if not os.path.exists(self.cache_dir):
+            os.mkdir(self.cache_dir)
         self.data_dir = hparams.data_dir
+        if not os.path.exists(self.data_dir):
+            os.mkdir(self.data_dir)
         tn = hparams.tokenizer_name
         model_type = hparams.model_name_or_path
         self.tokenizer_name = tn if tn else model_type
@@ -513,7 +520,6 @@ class TokenClassificationDataModule(pl.LightningDataModule):
             shuffle=shuffle,
         )
 
-    @property
     def train_dataloader(self):
         return self.get_dataloader(
             self.train_dataset,
@@ -522,7 +528,6 @@ class TokenClassificationDataModule(pl.LightningDataModule):
             shuffle=True,
         )
 
-    @property
     def val_dataloader(self):
         return self.get_dataloader(
             self.dev_dataset,
@@ -531,7 +536,6 @@ class TokenClassificationDataModule(pl.LightningDataModule):
             shuffle=False,
         )
 
-    @property
     def test_dataloader(self):
         return self.get_dataloader(
             self.test_dataset,
@@ -613,12 +617,6 @@ class TokenClassificationDataModule(pl.LightningDataModule):
             help="Path to a file containing all labels. If not specified, CoNLL-2003 labels are used.",
         )
         parser.add_argument(
-            "--tokenizer_name",
-            default=None,
-            type=str,
-            help="(Common)Pretrained tokenizer name or path if not the same as model_name",
-        )
-        parser.add_argument(
             "--data_dir",
             default="data",
             type=str,
@@ -640,19 +638,21 @@ class TokenClassificationModule(pl.LightningModule):
     Initialize a model and config for token-classification
     """
 
-    def __init__(self, hparams):
+    def __init__(self, hparams: Union[Dict, Namespace]):
+        # NOTE: internal code may pass hparams as dict **kwargs
         if type(hparams) == dict:
             hparams = Namespace(**hparams)
 
         label_token_aligner = LabelTokenAligner(hparams.labels)
-        self.label_map = label_token_aligner.labels_to_id
-        num_labels = len(self.label_map)
+        self.label_ids_to_label = label_token_aligner.ids_to_label
+        num_labels = len(self.label_ids_to_label)
         self.scheduler = None
         self.optimizer = None
 
         super().__init__()
-
+        # Enable to access arguments via self.hparams
         self.save_hyperparameters(hparams)
+
         self.step_count = 0
         self.output_dir = Path(self.hparams.output_dir)
         self.cache_dir = None
@@ -660,6 +660,15 @@ class TokenClassificationModule(pl.LightningModule):
             if not os.path.exists(self.hparams.cache_dir):
                 os.mkdir(self.hparams.cache_dir)
             self.cache_dir = self.hparams.cache_dir
+
+        # trf>=4.0.0: PreTrainedTokenizerFast by default
+        # NOTE: AutoTokenizer doesn't load PreTrainedTokenizerFast...
+        tn = self.hparams.tokenizer_name
+        self.tokenizer_name = tn if tn else self.hparams.model_name_or_path
+        self.tokenizer = BertTokenizerFast.from_pretrained(
+            self.tokenizer_name,
+            cache_dir=self.cache_dir,
+        )
 
         # AutoConfig
         self.config: PretrainedConfig = BertConfig.from_pretrained(
@@ -748,67 +757,67 @@ class TokenClassificationModule(pl.LightningModule):
         }
 
     def test_step(self, test_batch: InputFeatures, batch_idx) -> Dict:
-        return self.validation_step(test_batch, batch_idx)
-
-    def _eval_end(self, outputs: List[Dict]):
-        val_loss_mean = torch.stack([x["val_loss"] for x in outputs]).mean()
-
-        preds = np.concatenate([x["pred"] for x in outputs], axis=0)
-        preds = np.argmax(preds, axis=2)
-        target_ids = np.concatenate([x["target"] for x in outputs], axis=0)
-
-        target_list = [[] for _ in range(target_ids.shape[0])]
-        preds_list = [[] for _ in range(target_ids.shape[0])]
-        for i in range(target_ids.shape[0]):
-            for j in range(target_ids.shape[1]):
-                if target_ids[i, j] != PAD_TOKEN_LABEL_ID:
-                    target_list[i].append(self.label_map[target_ids[i][j]])
-                    preds_list[i].append(self.label_map[preds[i][j]])
-
-        results = {
-            "val_loss": val_loss_mean,
-            "accuracy_score": accuracy_score(target_list, preds_list),
-            "precision": precision_score(target_list, preds_list),
-            "recall": recall_score(target_list, preds_list),
-            "f1": f1_score(target_list, preds_list),
+        inputs = {
+            "input_ids": test_batch.input_ids,
+            "attention_mask": test_batch.attention_mask,
+            "token_type_ids": test_batch.token_type_ids
+            if self.config.model_type in ["bert", "xlnet"]
+            else None,
+            "labels": test_batch.label_ids,
+        }
+        output: TokenClassifierOutput = self(**inputs)
+        logits = output.logits
+        preds = logits.detach().cpu().numpy()
+        target_ids = []
+        if inputs["labels"].shape[0] > 0:
+            target_ids = inputs["labels"].detach().cpu().numpy()
+        return {
+            "pred": preds,
+            "target": target_ids,
         }
 
-        ret = {k: v for k, v in results.items()}
-        ret["log"] = results
-        return ret, preds_list, target_list
-
-    def validation_epoch_end(self, outputs: List[Dict]) -> Dict:
+    def validation_epoch_end(self, outputs: List[Dict]):
         """
         Computes average validation loss
         :param outputs: outputs after every epoch end
         :return: output - average valid loss
         """
-        ret, _, _ = self._eval_end(outputs)
-        # pytorch_lightning/trainer/logging.py#L139
-        logs = ret["log"]
-        avg_loss = logs["val_loss"]
-        self.log("val_loss", avg_loss, sync_dist=True)
-        return {"val_loss": avg_loss, "log": logs, "progress_bar": logs}
+        val_loss_mean = torch.stack([x["val_loss"] for x in outputs]).mean()
+        results = {
+            "val_loss": val_loss_mean,
+        }
+        self.log("val_loss", results["val_loss"], sync_dist=True)
 
-    def test_epoch_end(self, outputs: List[Dict]) -> Dict:
+    def test_epoch_end(self, outputs: List[Dict]):
         """
         Computes average test metrics
         :param outputs: outputs after every epoch end
         :return: output - average test metrics
         """
-        avg_test_acc = torch.stack([x["test_acc"] for x in outputs]).mean()
-        self.log("avg_test_acc", avg_test_acc)
-        ret, _, _ = self._eval_end(outputs)
-        # pytorch_lightning/trainer/logging.py#L139
-        logs = ret["log"]
-        return {
-            "test_accuracy": logs["accuracy_score"],
-            "test_precision": logs["precision"],
-            "test_recall": logs["recall"],
-            "test_f1": logs["f1"],
-            "log": logs,
-            "progress_bar": logs,
+
+        preds = np.concatenate([x["pred"] for x in outputs], axis=0)
+        preds = np.argmax(preds, axis=2)
+        target_ids = np.concatenate([x["target"] for x in outputs], axis=0)
+
+        target_list: StrListList = [[] for _ in range(target_ids.shape[0])]
+        preds_list: StrListList = [[] for _ in range(target_ids.shape[0])]
+        for i in range(target_ids.shape[0]):
+            for j in range(target_ids.shape[1]):
+                if target_ids[i][j] != PAD_TOKEN_LABEL_ID:
+                    target_list[i].append(self.label_ids_to_label[target_ids[i][j]])
+                    preds_list[i].append(self.label_ids_to_label[preds[i][j]])
+
+        results = {
+            "accuracy_score": accuracy_score(target_list, preds_list),
+            "precision": precision_score(target_list, preds_list, mode='strict', scheme=BILOU),
+            "recall": recall_score(target_list, preds_list, mode='strict', scheme=BILOU),
+            "f1": f1_score(target_list, preds_list, mode='strict', scheme=BILOU),
         }
+
+        self.log("test_accuracy", results["accuracy_score"])
+        self.log("test_precision", results["precision"])
+        self.log("test_recall", results["recall"])
+        self.log("test_f1", results["f1"])
 
     def configure_optimizers(self):
         """Prepare optimizer and schedule (linear warmup and decay)"""
@@ -848,7 +857,7 @@ class TokenClassificationModule(pl.LightningModule):
         self.optimizer = optimizer
         # scheduler = {"scheduler": scheduler, "interval": "step", "frequency": 1}
         self.scheduler = {
-            "scheduler": torch.optim.lr_scheduler.ReduceLROnPlateau(
+            "scheduler": ReduceLROnPlateau(
                 self.optimizer,
                 mode="min",
                 factor=0.2,
@@ -927,34 +936,23 @@ class TokenClassificationModule(pl.LightningModule):
             type=int,
             help="Linear warmup over warmup_steps.",
         )
-        parser.add_argument(
-            "--num_train_epochs", dest="max_epochs", default=3, type=int
-        )
-
         parser.add_argument("--adafactor", action="store_true")
-
-        parser.add_argument(
-            "--gpus",
-            default=0,
-            type=int,
-            help="The number of GPUs allocated for this, it is by default 0 meaning none",
-        )
         return parser
 
 
 class LoggingCallback(pl.Callback):
-    def on_batch_end(self, trainer, pl_module):
-        lr_scheduler = trainer.lr_schedulers[0]["scheduler"]
-        lrs = {f"lr_group_{i}": lr for i, lr in enumerate(lr_scheduler.get_lr())}
-        pl_module.logger.log_metrics(lrs)
+    # def on_batch_end(self, trainer, pl_module):
+    #     lr_scheduler = trainer.lr_schedulers[0]["scheduler"]
+    #     # lrs = {f"lr_group_{i}": lr for i, lr in enumerate(lr_scheduler.get_lr())}
+    #     # pl_module.logger.log_metrics(lrs)
+    #     pl_module.logger.log_metrics({"last_lr": lr_scheduler._last_lr})
 
     def on_validation_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
         rank_zero_info("***** Validation results *****")
         metrics = trainer.callback_metrics
         # Log results
         for key in sorted(metrics):
-            if key not in ["log", "progress_bar"]:
-                rank_zero_info("{} = {}\n".format(key, str(metrics[key])))
+            rank_zero_info("{} = {}\n".format(key, str(metrics[key])))
 
     def on_test_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
         rank_zero_info("***** Test results *****")
@@ -965,19 +963,43 @@ class LoggingCallback(pl.Callback):
         )
         with open(output_test_results_file, "w") as writer:
             for key in sorted(metrics):
-                if key not in ["log", "progress_bar"]:
-                    rank_zero_info("{} = {}\n".format(key, str(metrics[key])))
-                    writer.write("{} = {}\n".format(key, str(metrics[key])))
+                rank_zero_info("{} = {}\n".format(key, str(metrics[key])))
+                writer.write("{} = {}\n".format(key, str(metrics[key])))
 
 
 def add_common_args(parser):
-    parser = pl.Trainer.add_argparse_args(parent_parser=parser)
+    parser.add_argument(
+        "--model_name_or_path",
+        default="",
+        type=str,
+        required=True,
+        help="(Common)Path to pretrained model or model identifier from huggingface.co/models",
+    )
+    parser.add_argument(
+        "--tokenizer_name",
+        default=None,
+        type=str,
+        help="(Common)Pretrained tokenizer name or path if not the same as model_name",
+    )
     parser.add_argument(
         "--output_dir",
         default=None,
         type=str,
         required=True,
         help="The output directory where the model predictions and checkpoints will be written.",
+    )
+    parser.add_argument(
+        "--gradient_accumulation_steps",
+        dest="accumulate_grad_batches",
+        type=int,
+        default=1,
+        help="Number of updates steps to accumulate before performing a backward/update pass.",
+    )
+    parser.add_argument(
+        "--num_train_epochs", dest="max_epochs", default=3, type=int
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42, help="random seed for initialization"
     )
     parser.add_argument(
         "--do_train", action="store_true", help="Whether to run training."
@@ -988,46 +1010,35 @@ def add_common_args(parser):
         help="Whether to run predictions on the test set.",
     )
     parser.add_argument(
-        "--seed", type=int, default=42, help="random seed for initialization"
-    )
-    parser.add_argument(
-        "--gradient_accumulation_steps",
-        dest="accumulate_grad_batches",
-        type=int,
-        default=1,
-        help="Number of updates steps to accumulate before performing a backward/update pass.",
-    )
-    parser.add_argument(
-        "--model_name_or_path",
-        default=PRETRAINED_MODEL,
-        type=str,
-        required=True,
-        help="(Common)Path to pretrained model or model identifier from huggingface.co/models",
-    )
-    parser.add_argument(
         "--cache_dir",
         default="cache",
         type=str,
         help="Where do you want to store the pre-trained models downloaded from huggingface.co",
     )
+    parser.add_argument(
+        "--gpus",
+        default=0,
+        type=int,
+        help="The number of GPUs allocated for this, it is by default 0 meaning none",
+    )
+    return parser
 
 def make_trainer(parser):
     """
     Prepare pl.Trainer with callbacks and args
     """
-    parser = TokenClassificationModule.add_model_specific_args(parent_parser=parser)
-    parser = TokenClassificationDataModule.add_model_specific_args(parent_parser=parser)
+    logger.info("Preparing pl.Trainer...")
     argparse_args = parser.parse_args()
 
     early_stopping = EarlyStopping(monitor="val_loss", mode="min", verbose=True)
 
     checkpoint_callback = ModelCheckpoint(
-        filepath=argparse_args.output_dir,
+        dirpath=argparse_args.output_dir,
+        filename='checkpoint-{epoch}-{val_loss:.2f}',
         save_top_k=1,
         verbose=True,
         monitor="val_loss",
         mode="min",
-        prefix="checkpoint",
     )
     lr_logger = LearningRateMonitor()
     logging_callback = LoggingCallback()
@@ -1039,27 +1050,26 @@ def make_trainer(parser):
 
     trainer = pl.Trainer.from_argparse_args(
         argparse_args,
-        callbacks=[lr_logger, early_stopping, logging_callback],
-        checkpoint_callback=checkpoint_callback,
+        callbacks=[lr_logger, early_stopping, checkpoint_callback, logging_callback],
         **train_params,
     )
-    return trainer
+    return trainer, checkpoint_callback
 
 
 def make_model_and_dm(parser):
     """
     Prepare pl.LightningDataModule and pl.LightningModule
     """
-    parser = TokenClassificationModule.add_model_specific_args(parent_parser=parser)
-    parser = TokenClassificationDataModule.add_model_specific_args(parent_parser=parser)
+    logger.info("Preparing pl.LightningDataModule...")
     args = parser.parse_args()
-    dict_args = vars(args)
-
-    dm = TokenClassificationDataModule(**dict_args)
+    # dict_args = vars(args)
+    logger.info("Preparing pl.LightningModule...")
+    # print(dict_args)
+    dm = TokenClassificationDataModule(args)
     dm.prepare_data()
     dm.setup(stage="fit")
     # DataModule must be loaded first, because label_types.txt is automatically generated
-    model = TokenClassificationModule(**dict_args)
+    model = TokenClassificationModule(args)
 
     return model, dm
 
@@ -1067,7 +1077,10 @@ def make_model_and_dm(parser):
 if __name__ == "__main__":
 
     parser = ArgumentParser(description="Transformers Token Classifier")
-    add_common_args(parser)
+    # parser = pl.Trainer.add_argparse_args(parent_parser=parser)
+    parser = add_common_args(parser)
+    parser = TokenClassificationModule.add_model_specific_args(parent_parser=parser)
+    parser = TokenClassificationDataModule.add_model_specific_args(parent_parser=parser)
     args = parser.parse_args()
 
     # init
@@ -1079,17 +1092,19 @@ if __name__ == "__main__":
 
     Path(args.output_dir).mkdir(exist_ok=True)
 
-    mlflow.pytorch.autolog()
+    # mlflow.pytorch.autolog()
 
     model, dm = make_model_and_dm(parser)
-    trainer = make_trainer(parser)
+    trainer, checkpoint_callback = make_trainer(parser)
 
     # MLflow Autologging is performed here
     trainer.fit(model, dm)
 
     if args.do_predict:
-        checkpoints = list(
-            sorted(Path(args.output_dir).glob("**/checkpoint-epoch=*.ckpt"))
-        )
-        model = model.load_from_checkpoint(checkpoints[-1])
-        trainer.test(model)
+        # NOTE: load the best checkpoint automatically
+        # to use the latest, pass `ckpt_path=None`
+        trainer.test()  # test_dataloaders=dm.test_dataloader
+        # best_model_path = checkpoint_callback.best_model_path
+        # trainer.test(ckpt_path=best_model_path)
+        # model = model.load_from_checkpoint(best_model_path)
+        
