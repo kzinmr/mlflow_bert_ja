@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import Enum
 from itertools import product, starmap
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, TextIO, Union
+from typing import Any, Dict, List, Optional, Set, Union
 
 import mlflow.pytorch
 import numpy as np
@@ -88,39 +88,6 @@ class InputFeatures:
     label_ids: Optional[IntList] = None
 
 
-class InputFeaturesBatch:
-    def __init__(self, features: List[InputFeatures]):
-        self.input_ids: torch.Tensor
-        self.attention_masks: torch.Tensor
-        self.token_type_ids: Optional[torch.Tensor]
-        self.labels: Optional[torch.Tensor]
-
-        self.n_features = len(features)
-        input_ids: IntListList = []
-        masks: IntListList = []
-        token_type_ids: IntListList = []
-        label_ids: IntListList = []
-        for f in features:
-            input_ids.append(f.input_ids)
-            masks.append(f.attention_mask)
-            if f.token_type_ids is not None:
-                token_type_ids.append(f.token_type_ids)
-            if f.label_ids is not None:
-                label_ids.append(f.label_ids)
-        self.input_ids = torch.LongTensor(input_ids)
-        self.attention_mask = torch.LongTensor(masks)
-        if token_type_ids:
-            self.token_type_ids = torch.LongTensor(token_type_ids)
-        if label_ids:
-            self.label_ids = torch.LongTensor(label_ids)
-
-    def __len__(self):
-        return self.n_features
-
-    def __getitem__(self, item):
-        return getattr(self, item)
-
-
 def download_dataset(data_dir: str):
     def _download_data(url, file_path):
         response = requests.get(url)
@@ -148,12 +115,7 @@ def bio2biolu(lines: StrList, label_idx: int = -1, delimiter: str = "\t") -> Str
         if is_boundary_line(line):
             new_lines.append(line)
         else:
-            prev_iob = None
             next_iob = None
-            if i > 0:
-                prev_line = lines[i - 1].strip()
-                if not is_boundary_line(prev_line):
-                    prev_iob = prev_line.split(delimiter)[label_idx][0]
             if i < n_lines - 1:
                 next_line = lines[i + 1].strip()
                 if not is_boundary_line(next_line):
@@ -167,19 +129,19 @@ def bio2biolu(lines: StrList, label_idx: int = -1, delimiter: str = "\t") -> Str
             iob = current_label[0]
 
             # O -> O
-            # (*,B,I) -> B
-            # (*,B,O)|(*,B,B)(*,B,None) -> U
-            # (*,I,I) -> I
-            # (*I,B)(*,I,O)(*,I,None) -> L
-            tpl = (prev_iob, iob, next_iob)
+            # (B,I) -> B
+            # (B,O)|(B,B)(B,None) -> U
+            # (I,I) -> I
+            # (I,B)(I,O)(I,None) -> L
+            tpl = (iob, next_iob)
             current_iob = iob
-            if tpl[1:] == ("B", "I"):
+            if tpl == ("B", "I"):
                 current_iob = "B"
-            elif tpl[1:] == ("I", "I"):
+            elif tpl == ("I", "I"):
                 current_iob = "I"
-            elif tpl[1:] in {("B", "O"), ("B", "B"), ("B", None)}:
+            elif tpl in {("B", "O"), ("B", "B"), ("B", None)}:
                 current_iob = "U"
-            elif tpl[1:] in {("I", "B"), ("I", "O"), ("I", None)}:
+            elif tpl in {("I", "B"), ("I", "O"), ("I", None)}:
                 current_iob = "L"
             elif iob == "O":
                 current_iob = "O"
@@ -348,7 +310,7 @@ class LabelTokenAligner:
         return list(map(lambda x: self.labels_to_id.get(x, 0), raw_labels))
 
 
-class NERDataset(Dataset):
+class TokenClassificationDataset(Dataset):
     """
     Build feature dataset so that the model can load
     """
@@ -423,6 +385,38 @@ class NERDataset(Dataset):
         return self.features[idx]
 
 
+class InputFeaturesBatch:
+    def __init__(self, features: List[InputFeatures]):
+        self.input_ids: torch.Tensor
+        self.attention_masks: torch.Tensor
+        self.token_type_ids: Optional[torch.Tensor]
+        self.label_ids: Optional[torch.Tensor]
+
+        self.n_features = len(features)
+        input_ids: IntListList = []
+        masks: IntListList = []
+        token_type_ids: IntListList = []
+        label_ids: IntListList = []
+        for f in features:
+            input_ids.append(f.input_ids)
+            masks.append(f.attention_mask)
+            if f.token_type_ids is not None:
+                token_type_ids.append(f.token_type_ids)
+            if f.label_ids is not None:
+                label_ids.append(f.label_ids)
+        self.input_ids = torch.LongTensor(input_ids)
+        self.attention_mask = torch.LongTensor(masks)
+        if token_type_ids:
+            self.token_type_ids = torch.LongTensor(token_type_ids)
+        if label_ids:
+            self.label_ids = torch.LongTensor(label_ids)
+
+    def __len__(self):
+        return self.n_features
+
+    def __getitem__(self, item):
+        return getattr(self, item)
+
 class TokenClassificationDataModule(pl.LightningDataModule):
     """
     Prepare dataset and build DataLoader
@@ -436,9 +430,9 @@ class TokenClassificationDataModule(pl.LightningDataModule):
         self.train_data: List[StringSpanExample]
         self.dev_data: List[StringSpanExample]
         self.test_data: List[StringSpanExample]
-        self.train_dataset: NERDataset
-        self.dev_dataset: NERDataset
-        self.test_dataset: NERDataset
+        self.train_dataset: TokenClassificationDataset
+        self.dev_dataset: TokenClassificationDataset
+        self.test_dataset: TokenClassificationDataset
 
         super().__init__()
         self.max_seq_length = hparams.max_seq_length
@@ -448,14 +442,12 @@ class TokenClassificationDataModule(pl.LightningDataModule):
         self.data_dir = hparams.data_dir
         if not os.path.exists(self.data_dir):
             os.mkdir(self.data_dir)
-        tn = hparams.tokenizer_name
-        model_type = hparams.model_name_or_path
-        self.tokenizer_name = tn if tn else model_type
+        self.tokenizer_name = hparams.model_name_or_path
         self.train_batch_size = hparams.train_batch_size
         self.eval_batch_size = hparams.eval_batch_size
         self.num_workers = hparams.num_workers
-        self.labels_path = hparams.labels
         self.num_samples = hparams.num_samples
+        self.labels_path = hparams.labels
         # is_xlnet = bool(model_type in ["xlnet"])
 
     def prepare_data(self):
@@ -496,18 +488,11 @@ class TokenClassificationDataModule(pl.LightningDataModule):
                 fp.write("\n".join(label_types))
         self.label_token_aligner = LabelTokenAligner(self.labels_path)
 
-        self.train_dataset = self.get_dataset(self.train_data)
-        self.dev_dataset = self.get_dataset(self.dev_data)
-        self.test_dataset = self.get_dataset(self.test_data)
+        self.train_dataset = self.create_dataset(self.train_data)
+        self.dev_dataset = self.create_dataset(self.dev_data)
+        self.test_dataset = self.create_dataset(self.test_data)
 
-    def get_dataset(self, data: List[StringSpanExample]):
-        return NERDataset(
-            data,
-            self.label_token_aligner,
-            self.tokenizer,
-            self.max_seq_length,
-            # pin_memory=True
-        )
+        self.dataset_size = len(self.train_dataset)
 
     def setup(self, stage=None):
         """
@@ -515,19 +500,34 @@ class TokenClassificationDataModule(pl.LightningDataModule):
         but here we assume the dataset is splitted in prior
         """
 
-    def get_dataloader(
-        self, ds: NERDataset, bs: int, num_workers: int = 0, shuffle: bool = False
+    def create_dataset(
+        self, data: List[StringSpanExample]
+    ) -> TokenClassificationDataset:
+        return TokenClassificationDataset(
+            data,
+            self.label_token_aligner,
+            self.tokenizer,
+            self.max_seq_length,
+            # pin_memory=True
+        )
+
+    def create_dataloader(
+        self,
+        ds: TokenClassificationDataset,
+        batch_size: int,
+        num_workers: int = 0,
+        shuffle: bool = False,
     ) -> DataLoader:
         return DataLoader(
             ds,
             collate_fn=InputFeaturesBatch,
-            batch_size=bs,
+            batch_size=batch_size,
             num_workers=num_workers,
             shuffle=shuffle,
         )
 
     def train_dataloader(self):
-        return self.get_dataloader(
+        return self.create_dataloader(
             self.train_dataset,
             self.train_batch_size,
             num_workers=self.num_workers,
@@ -535,7 +535,7 @@ class TokenClassificationDataModule(pl.LightningDataModule):
         )
 
     def val_dataloader(self):
-        return self.get_dataloader(
+        return self.create_dataloader(
             self.dev_dataset,
             self.eval_batch_size,
             num_workers=self.num_workers,
@@ -543,36 +543,17 @@ class TokenClassificationDataModule(pl.LightningDataModule):
         )
 
     def test_dataloader(self):
-        return self.get_dataloader(
+        return self.create_dataloader(
             self.test_dataset,
             self.eval_batch_size,
             num_workers=self.num_workers,
             shuffle=False,
         )
 
-    @staticmethod
-    def write_predictions_to_file(
-        writer: TextIO, test_input_reader: TextIO, preds_list: List
-    ):
-        example_id = 0
-        for line in test_input_reader:
-            if line.startswith("-DOCSTART-") or line == "" or line == "\n":
-                writer.write(line)
-                if not preds_list[example_id]:
-                    example_id += 1
-            elif preds_list[example_id]:
-                output_line = (
-                    line.split()[0] + " " + preds_list[example_id].pop(0) + "\n"
-                )
-                writer.write(output_line)
-            else:
-                logger.warning(
-                    "Maximum sequence length exceeded: No prediction for '%s'.",
-                    line.split()[0],
-                )
-
     def total_steps(self) -> int:
-        """The number of total training steps that will be run. Used for lr scheduler purposes."""
+        """
+        The number of total training steps that will be run. Used for lr scheduler purposes.
+        """
         num_devices = max(1, self.hparams.gpus)  # TODO: consider num_tpu_cores
         effective_batch_size = (
             self.hparams.train_batch_size
@@ -583,11 +564,6 @@ class TokenClassificationDataModule(pl.LightningDataModule):
 
     @staticmethod
     def add_model_specific_args(parent_parser):
-        """
-        Returns the text and the labels of the specified item
-        :param parent_parser: Application specific parser
-        :return: Returns the augmented arugument parser
-        """
         parser = ArgumentParser(parents=[parent_parser], add_help=False)
         parser.add_argument(
             "--train_batch_size",
@@ -608,7 +584,6 @@ class TokenClassificationDataModule(pl.LightningDataModule):
             metavar="N",
             help="number of workers (default: 3)",
         )
-
         parser.add_argument(
             "--max_seq_length",
             default=256,
@@ -646,7 +621,7 @@ class TokenClassificationModule(pl.LightningModule):
 
     def __init__(self, hparams: Union[Dict, Namespace]):
         # NOTE: internal code may pass hparams as dict **kwargs
-        if type(hparams) == dict:
+        if isinstance(hparams, Dict):
             hparams = Namespace(**hparams)
 
         label_token_aligner = LabelTokenAligner(hparams.labels)
@@ -667,20 +642,19 @@ class TokenClassificationModule(pl.LightningModule):
                 os.mkdir(self.hparams.cache_dir)
             self.cache_dir = self.hparams.cache_dir
 
+        # AutoTokenizer
         # trf>=4.0.0: PreTrainedTokenizerFast by default
         # NOTE: AutoTokenizer doesn't load PreTrainedTokenizerFast...
-        tn = self.hparams.tokenizer_name
-        self.tokenizer_name = tn if tn else self.hparams.model_name_or_path
+        self.tokenizer_name = self.hparams.model_name_or_path
         self.tokenizer = BertTokenizerFast.from_pretrained(
             self.tokenizer_name,
             cache_dir=self.cache_dir,
         )
 
         # AutoConfig
+        config_name = self.hparams.model_name_or_path
         self.config: PretrainedConfig = BertConfig.from_pretrained(
-            self.hparams.config_name
-            if self.hparams.config_name
-            else self.hparams.model_name_or_path,
+            config_name,
             **({"num_labels": num_labels} if num_labels is not None else {}),
             cache_dir=self.cache_dir,
         )
@@ -696,6 +670,7 @@ class TokenClassificationModule(pl.LightningModule):
                     self.config, p
                 ), f"model config doesn't have a `{p}` attribute"
                 setattr(self.config, p, getattr(self.hparams, p, None))
+
         # AutoModelForTokenClassification
         self.model: PreTrainedModel = BertForTokenClassification.from_pretrained(
             self.hparams.model_name_or_path,
@@ -706,19 +681,22 @@ class TokenClassificationModule(pl.LightningModule):
         # for param in self.model.parameters():
         #     param.requires_grad = False
 
-    def forward(self, **inputs):
-        """ BertForTokenClassification.forward """
+    def forward(self, **inputs) -> TokenClassifierOutput:
+        """ BertForTokenClassification.forward(
+            input_ids=None,
+            attention_mask=None,
+            token_type_ids=None,
+            position_ids=None,
+            head_mask=None,
+            inputs_embeds=None,
+            labels=None,
+            output_attentions=None,
+            output_hidden_states=None,
+            return_dict=None,)
+        """
         return self.model(**inputs)
 
-    def training_step(self, train_batch: InputFeatures, batch_idx) -> Dict:
-        """
-        Training the data as batches and returns training loss on each batch
-        :param train_batch Batch data
-        :param batch_idx: Batch indices
-        :return: output - Training loss
-        """
-        # XLM and RoBERTa don"t use token_type_ids
-        # if self.config.model_type != "distilbert":
+    def training_step(self, train_batch: InputFeaturesBatch, batch_idx) -> Dict:
         # .to(self.device) is not necessary with pl.Traner
         inputs = {
             "input_ids": train_batch.input_ids,
@@ -733,15 +711,7 @@ class TokenClassificationModule(pl.LightningModule):
         self.log("train_loss", loss)
         return {"loss": loss}
 
-    def validation_step(self, val_batch: InputFeatures, batch_idx) -> Dict:
-        """
-        Performs validation of data in batches
-        :param val_batch: Batch data
-        :param batch_idx: Batch indices
-        :return: output - valid step loss
-        """
-        # XLM and RoBERTa don"t use token_type_ids
-        # if self.config.model_type != "distilbert":
+    def validation_step(self, val_batch: InputFeaturesBatch, batch_idx) -> Dict:
         # .to(self.device) is not necessary with pl.Traner
         inputs = {
             "input_ids": val_batch.input_ids,
@@ -752,17 +722,14 @@ class TokenClassificationModule(pl.LightningModule):
             "labels": val_batch.label_ids,
         }
         output: TokenClassifierOutput = self(**inputs)
-        loss, logits = output.loss, output.logits
-        preds = logits.detach().cpu().numpy()
-        target_ids = inputs["labels"].detach().cpu().numpy()
-        self.log("val_loss", loss)
+        loss = output.loss
+        # self.log("val_step_loss", loss)
         return {
-            "val_loss": loss.detach().cpu(),
-            "pred": preds,
-            "target": target_ids,
+            "val_step_loss": loss.detach().cpu(),
         }
 
-    def test_step(self, test_batch: InputFeatures, batch_idx) -> Dict:
+    def test_step(self, test_batch: InputFeaturesBatch, batch_idx) -> Dict:
+        # .to(self.device) is not necessary with pl.Traner
         inputs = {
             "input_ids": test_batch.input_ids,
             "attention_mask": test_batch.attention_mask,
@@ -783,24 +750,10 @@ class TokenClassificationModule(pl.LightningModule):
         }
 
     def validation_epoch_end(self, outputs: List[Dict]):
-        """
-        Computes average validation loss
-        :param outputs: outputs after every epoch end
-        :return: output - average valid loss
-        """
-        val_loss_mean = torch.stack([x["val_loss"] for x in outputs]).mean()
-        results = {
-            "val_loss": val_loss_mean,
-        }
-        self.log("val_loss", results["val_loss"], sync_dist=True)
+        avg_loss = torch.stack([x["val_step_loss"] for x in outputs]).mean()
+        self.log("val_loss", avg_loss, sync_dist=True)
 
     def test_epoch_end(self, outputs: List[Dict]):
-        """
-        Computes average test metrics
-        :param outputs: outputs after every epoch end
-        :return: output - average test metrics
-        """
-
         preds = np.concatenate([x["pred"] for x in outputs], axis=0)
         preds = np.argmax(preds, axis=2)
         target_ids = np.concatenate([x["target"] for x in outputs], axis=0)
@@ -852,20 +805,18 @@ class TokenClassificationModule(pl.LightningModule):
             },
         ]
         if self.hparams.adafactor:
-            optimizer = Adafactor(
+            self.optimizer = Adafactor(
                 optimizer_grouped_parameters,
                 lr=self.hparams.learning_rate,
                 scale_parameter=False,
                 relative_step=False,
             )
         else:
-            optimizer = AdamW(
+            self.optimizer = AdamW(
                 optimizer_grouped_parameters,
                 lr=self.hparams.learning_rate,
                 eps=self.hparams.adam_epsilon,
             )
-        self.optimizer = optimizer
-        # scheduler = {"scheduler": scheduler, "interval": "step", "frequency": 1}
         self.scheduler = {
             "scheduler": ReduceLROnPlateau(
                 self.optimizer,
@@ -889,19 +840,8 @@ class TokenClassificationModule(pl.LightningModule):
 
     @staticmethod
     def add_model_specific_args(parent_parser):
-        """
-        Returns the text and the label of the specified item
-        :param parent_parser: Application specific parser
-        :return: Returns the augmented arugument parser
-        """
         parser = ArgumentParser(parents=[parent_parser], add_help=False)
 
-        parser.add_argument(
-            "--config_name",
-            default=None,
-            type=str,
-            help="Pretrained config name or path if not the same as model_name",
-        )
         parser.add_argument(
             "--encoder_layerdrop",
             type=float,
@@ -923,28 +863,22 @@ class TokenClassificationModule(pl.LightningModule):
             help="Attention dropout probability (Optional). Goes into model.config",
         )
         parser.add_argument(
-            "--learning_rate",
-            default=5e-5,
-            type=float,
-            help="The initial learning rate for Adam.",
-        )
-        parser.add_argument(
             "--weight_decay",
             default=0.0,
             type=float,
             help="Weight decay if we apply some.",
         )
         parser.add_argument(
+            "--learning_rate",
+            default=5e-5,
+            type=float,
+            help="The initial learning rate for Adam.",
+        )
+        parser.add_argument(
             "--adam_epsilon",
             default=1e-8,
             type=float,
             help="Epsilon for Adam optimizer.",
-        )
-        parser.add_argument(
-            "--warmup_steps",
-            default=0,
-            type=int,
-            help="Linear warmup over warmup_steps.",
         )
         parser.add_argument("--adafactor", action="store_true")
         return parser
@@ -977,67 +911,10 @@ class LoggingCallback(pl.Callback):
                 writer.write("{} = {}\n".format(key, str(metrics[key])))
 
 
-def add_common_args(parser):
-    parser.add_argument(
-        "--model_name_or_path",
-        default="",
-        type=str,
-        required=True,
-        help="(Common)Path to pretrained model or model identifier from huggingface.co/models",
-    )
-    parser.add_argument(
-        "--tokenizer_name",
-        default=None,
-        type=str,
-        help="(Common)Pretrained tokenizer name or path if not the same as model_name",
-    )
-    parser.add_argument(
-        "--output_dir",
-        default=None,
-        type=str,
-        required=True,
-        help="The output directory where the model predictions and checkpoints will be written.",
-    )
-    parser.add_argument(
-        "--gradient_accumulation_steps",
-        dest="accumulate_grad_batches",
-        type=int,
-        default=1,
-        help="Number of updates steps to accumulate before performing a backward/update pass.",
-    )
-    parser.add_argument("--num_train_epochs", dest="max_epochs", default=3, type=int)
-    parser.add_argument(
-        "--seed", type=int, default=42, help="random seed for initialization"
-    )
-    parser.add_argument(
-        "--do_train", action="store_true", help="Whether to run training."
-    )
-    parser.add_argument(
-        "--do_predict",
-        action="store_true",
-        help="Whether to run predictions on the test set.",
-    )
-    parser.add_argument(
-        "--cache_dir",
-        default="cache",
-        type=str,
-        help="Where do you want to store the pre-trained models downloaded from huggingface.co",
-    )
-    parser.add_argument(
-        "--gpus",
-        default=0,
-        type=int,
-        help="The number of GPUs allocated for this, it is by default 0 meaning none",
-    )
-    return parser
-
-
-def make_trainer(parser):
+def make_trainer(argparse_args: Namespace):
     """
     Prepare pl.Trainer with callbacks and args
     """
-    logger.info("Preparing pl.Trainer...")
-    argparse_args = parser.parse_args()
 
     early_stopping = EarlyStopping(monitor="val_loss", mode="min", verbose=True)
 
@@ -1065,20 +942,15 @@ def make_trainer(parser):
     return trainer, checkpoint_callback
 
 
-def make_model_and_dm(parser):
+def make_model_and_dm(argparse_args: Namespace):
     """
     Prepare pl.LightningDataModule and pl.LightningModule
     """
-    logger.info("Preparing pl.LightningDataModule...")
-    args = parser.parse_args()
-    # dict_args = vars(args)
-    logger.info("Preparing pl.LightningModule...")
-    # print(dict_args)
-    dm = TokenClassificationDataModule(args)
+    dm = TokenClassificationDataModule(argparse_args)
     dm.prepare_data()
     dm.setup(stage="fit")
     # DataModule must be loaded first, because label_types.txt is automatically generated
-    model = TokenClassificationModule(args)
+    model = TokenClassificationModule(argparse_args)
 
     return model, dm
 
@@ -1086,8 +958,8 @@ def make_model_and_dm(parser):
 if __name__ == "__main__":
 
     parser = ArgumentParser(description="Transformers Token Classifier")
-    # parser = pl.Trainer.add_argparse_args(parent_parser=parser)
-    parser = add_common_args(parser)
+
+    parser = pl.Trainer.add_argparse_args(parent_parser=parser)
     parser = TokenClassificationModule.add_model_specific_args(parent_parser=parser)
     parser = TokenClassificationDataModule.add_model_specific_args(parent_parser=parser)
     args = parser.parse_args()
@@ -1103,16 +975,14 @@ if __name__ == "__main__":
 
     mlflow.pytorch.autolog()
 
-    model, dm = make_model_and_dm(parser)
-    trainer, checkpoint_callback = make_trainer(parser)
+    model, dm = make_model_and_dm(args)
+    trainer, checkpoint_callback = make_trainer(args)
 
     # MLflow Autologging is performed here
     trainer.fit(model, dm)
 
     if args.do_predict:
         # NOTE: load the best checkpoint automatically
-        # to use the latest, pass `ckpt_path=None`
-        trainer.test()  # test_dataloaders=dm.test_dataloader
+        trainer.test()
         # best_model_path = checkpoint_callback.best_model_path
-        # trainer.test(ckpt_path=best_model_path)
         # model = model.load_from_checkpoint(best_model_path)

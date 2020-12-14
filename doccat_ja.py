@@ -1,9 +1,11 @@
 import os
 import random
 import tarfile
-from argparse import ArgumentParser
+from argparse import ArgumentParser, Namespace
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
-from typing import Final, Optional, Tuple
+from typing import Any, Dict, List, Optional, Union
 
 import mlflow.pytorch
 import numpy as np
@@ -11,44 +13,70 @@ import pandas as pd
 import pytorch_lightning as pl
 import requests
 import torch
-import torch.nn.functional as F
 from pytorch_lightning.callbacks import (
     EarlyStopping,
     LearningRateMonitor,
     ModelCheckpoint
 )
+from pytorch_lightning.utilities import rank_zero_info
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
-from torch import nn
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Dataset
-from transformers import AdamW, BertModel, BertTokenizer
-
-TEXT_COL_NAME: Final[str] = "text"
-LABEL_COL_NAME: Final[str] = "label"
-INPUT_IDS: Final[str] = "input_ids"
-ATTENTION_MASK: Final[str] = "attention_mask"
-
-PRE_TRAINED_MODEL_NAME: Final[str] = "cl-tohoku/bert-base-japanese"
-LABELS: Final[Tuple] = (
-    "sports-watch",
-    "topic-news",
-    "dokujo-tsushin",
-    "peachy",
-    "movie-enter",
-    "kaden-channel",
-    "livedoor-homme",
-    "smax",
-    "it-life-hack",
+from transformers import (
+    Adafactor,
+    AdamW,
+    BertConfig,
+    BertForSequenceClassification,
+    BertTokenizerFast,
+    PretrainedConfig,
+    PreTrainedModel,
+    PreTrainedTokenizerFast
 )
-# fix seed
-RANDOM_SEED: Final[int] = 42
-random.seed(RANDOM_SEED)
-os.environ["PYTHONHASHSEED"] = str(RANDOM_SEED)
-np.random.seed(RANDOM_SEED)
-torch.manual_seed(RANDOM_SEED)
+from transformers.modeling_outputs import SequenceClassifierOutput
+from transformers.optimization import Adafactor
+
+# huggingface/tokenizers: Disabling parallelism to avoid deadlocks.
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+IntList = List[int]
+IntListList = List[List[int]]
+TEXT_COL_NAME: str = "text"
+LABEL_COL_NAME: str = "label"
+
+class LABELS(Enum):
+    sports_watch = "sports-watch"
+    topic_news = "topic-news"
+    dokujo_tsushin = "dokujo-tsushin"
+    peachy = "peachy"
+    movie_enter = "movie-enter"
+    kaden_channel = "kaden-channel"
+    livedoor_homme = "livedoor-homme"
+    smax = "smax"
+    it_life_hack = "it-life-hack"
 
 
-def prepare_livedoor_corpus(data_dir: Path) -> Optional[Path]:
+class Split(Enum):
+    train = "train"
+    dev = "dev"
+    test = "test"
+
+
+@dataclass
+class InputExample:
+    guid: str
+    text: str
+    label: Optional[str]
+
+
+@dataclass
+class InputFeatures:
+    input_ids: IntList
+    attention_mask: IntList
+    label_ids: Optional[IntList]
+
+
+def download_and_extract_corpus(data_dir: Path) -> Optional[Path]:
     """livedoorコーパスデータのダウンロード"""
     filepath = Path("ldcc.tar")
     url = "https://www.rondhuit.com/download/ldcc-20140209.tar.gz"
@@ -64,16 +92,15 @@ def prepare_livedoor_corpus(data_dir: Path) -> Optional[Path]:
 
 
 def make_livedoor_corpus_dataset(data_dir: str = "./data") -> pd.DataFrame:
-    # TODO: add livedoor corpus downloader
     # ライブドアコーパスを[カテゴリ, 本文]形式でpd.DataFrameで読み込む
     pdir = Path(data_dir)
     if not (pdir / "text").exists():
         pdir.mkdir(exist_ok=True)
-        parent_path = prepare_livedoor_corpus(Path(data_dir))
+        parent_path = download_and_extract_corpus(Path(data_dir))
     else:
         parent_path = pdir / "text"
 
-    categories = LABELS
+    categories = [v.value for v in LABELS]
     docs = []
     for category in categories:
         for p in (parent_path / f"{category}").glob(f"{category}*.txt"):
@@ -87,92 +114,137 @@ def make_livedoor_corpus_dataset(data_dir: str = "./data") -> pd.DataFrame:
     return pd.DataFrame(docs, columns=[LABEL_COL_NAME, TEXT_COL_NAME])
 
 
-class DocCatDataset(Dataset):
-    def __init__(self, texts, labels, tokenizer, max_length):
+class SequenceClassificationDataset(Dataset):
+    def __init__(
+        self,
+        data: List[InputExample],
+        tokenizer: PreTrainedTokenizerFast,
+        max_seq_length: int,
+        label_to_id: Dict[str, int]
+    ):
         """
         Performs initialization of tokenizer
         :param texts: document texts
         :param labels: labels
         :param tokenizer: bert tokenizer
-        :param max_length: maximum length of the news text
+        :param max_seq_length: maximum length of the document text
         """
-        self.texts = texts
-        self.labels = labels
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        self.__texts_len = len(texts)
+        self.examples = data
+        texts = [ex.text for ex in self.examples]
+        labels = [ex.label for ex in self.examples if ex.label]
+
+        self.encodings = [
+            tokenizer.encode_plus(
+                text,
+                add_special_tokens=True,
+                max_length=max_seq_length,
+                return_token_type_ids=False,
+                padding="max_length",
+                return_attention_mask=True,
+                return_tensors="np",
+                truncation=True,
+            )
+            for text in texts
+        ]
+        if labels:
+            self.features = [
+                InputFeatures(
+                    input_ids=encoding.input_ids.flatten().tolist(),
+                    attention_mask=encoding.attention_mask.flatten().tolist(),
+                    label_ids=[label_to_id.get(label, 0)],
+                )
+                for encoding, label in zip(self.encodings, labels)
+            ]
+        else:
+            self.features = [
+                InputFeatures(
+                    input_ids=encoding.input_ids.flatten().tolist(),
+                    attention_mask=encoding.attention_mask.flatten().tolist(),
+                    label_ids=None
+                )
+                for encoding in self.encodings
+            ]
+        self._n_features = len(self.features)
 
     def __len__(self):
-        """
-        :return: returns the number of datapoints in the dataframe
-        """
-        return self.__texts_len
+        return self._n_features
+
+    def __getitem__(self, idx) -> InputFeatures:
+        return self.features[idx]
+
+class InputFeaturesBatch:
+    def __init__(self, features: List[InputFeatures]):
+        self.input_ids: torch.Tensor
+        self.attention_masks: torch.Tensor
+        self.label_ids: Optional[torch.Tensor]
+
+        self.n_features = len(features)
+        input_ids_list: IntListList = []
+        masks_list: IntListList = []
+        label_ids: IntListList = []
+        for f in features:
+            input_ids_list.append(f.input_ids)
+            masks_list.append(f.attention_mask)
+            if f.label_ids is not None:
+                label_ids.append(f.label_ids)
+        self.input_ids = torch.LongTensor(input_ids_list)
+        self.attention_mask = torch.LongTensor(masks_list)
+        if label_ids:
+            self.label_ids = torch.LongTensor(label_ids)
+
+    def __len__(self):
+        return self.n_features
 
     def __getitem__(self, item):
-        """
-        Returns the text and the labels of the specified item
-        :param item: Index of sample text
-        :return: Returns the dictionary of text, input ids, attention mask, labels
-        """
-        text = str(self.texts[item])
-        label = self.labels[item]
-
-        encoding = self.tokenizer.encode_plus(
-            text,
-            add_special_tokens=True,
-            max_length=self.max_length,
-            return_token_type_ids=False,
-            padding="max_length",
-            return_attention_mask=True,
-            return_tensors="pt",
-            truncation=True,
-        )
-
-        return {
-            TEXT_COL_NAME: text,
-            INPUT_IDS: encoding[INPUT_IDS].flatten(),
-            ATTENTION_MASK: encoding[ATTENTION_MASK].flatten(),
-            LABEL_COL_NAME: torch.tensor(label, dtype=torch.long),
-        }
+        return getattr(self, item)
 
 
-class BertJapaneseDataModule(pl.LightningDataModule):
-    def __init__(self, **kwargs):
-        """
-        Initialization of inherited lightning data module
-        """
-        super(BertJapaneseDataModule, self).__init__()
-        self.PRE_TRAINED_MODEL_NAME = PRE_TRAINED_MODEL_NAME
-        self.df_train = None
-        self.df_val = None
-        self.df_test = None
-        self.train_data_loader = None
-        self.val_data_loader = None
-        self.test_data_loader = None
-        self.MAX_LEN = 512
-        self.encoding = None
-        self.tokenizer = None
-        self.args = kwargs
-        self.df_org = None
-        self.df_use = None
-        self.label2id = None
+class SequenceClassificationDataModule(pl.LightningDataModule):
+    """
+    Prepare dataset and build DataLoader
+    """
+
+    def __init__(self, hparams: Namespace):
+        self.tokenizer: PreTrainedTokenizerFast
+        self.df_train: pd.DataFrame
+        self.df_val: pd.DataFrame
+        self.df_test: pd.DataFrame
+        self.df_org: pd.DataFrame
+        self.df_use: pd.DataFrame
+        self.label2id: Dict[str, int]
+
+        super().__init__()
+        self.max_seq_length = hparams.max_seq_length
+        self.cache_dir = hparams.cache_dir
+        if not os.path.exists(self.cache_dir):
+            os.mkdir(self.cache_dir)
+        self.data_dir = hparams.data_dir
+        if not os.path.exists(self.data_dir):
+            os.mkdir(self.data_dir)
+
+        self.tokenizer_name = hparams.model_name_or_path
+        self.train_batch_size = hparams.train_batch_size
+        self.eval_batch_size = hparams.eval_batch_size
+        self.num_workers = hparams.num_workers
+        self.num_samples = hparams.num_samples
 
     def prepare_data(self):
         """
         Downloads the data and prepare the tokenizer
         """
-        self.tokenizer = BertTokenizer.from_pretrained(self.PRE_TRAINED_MODEL_NAME)
-        df = make_livedoor_corpus_dataset()
+        self.tokenizer = BertTokenizerFast.from_pretrained(
+            self.tokenizer_name, cache_dir=self.cache_dir
+        )
+        df = make_livedoor_corpus_dataset(self.data_dir)
         self.df_org = df
-        df = self.df_all
-        df.sample(frac=1)
-        df = df.iloc[: self.args["num_samples"]]
+
+        # df.sample(frac=1)
+        if self.num_samples > 0:
+            df = df.iloc[: self.num_samples]
         # label2id =  {k: v for v, k in enumerate(LABELS)}
-        label2id = {
-            k: v for v, k in enumerate(sorted(set(df.label.to_numpy().to_list())))
+        self.label2id = {
+            k: v for v, k in enumerate(sorted(set(df[LABEL_COL_NAME].values.tolist())))
         }
-        df[LABEL_COL_NAME] = df[LABEL_COL_NAME].apply(lambda x: label2id[x])
-        self.label2id = label2id
         self.df_use = df
 
     def setup(self, stage=None):
@@ -191,222 +263,281 @@ class BertJapaneseDataModule(pl.LightningDataModule):
             df_test, test_size=0.5, stratify=df_test[LABEL_COL_NAME]
         )
 
-        self.df_train = df_train
-        self.df_test = df_test
-        self.df_val = df_val
+        self.train_examples = [
+            InputExample(guid=f"train-{i}", text=t, label=l)
+            for i, (t, l) in df_train[[TEXT_COL_NAME, LABEL_COL_NAME]].iterrows()
+        ]
+        self.val_examples = [
+            InputExample(guid=f"val-{i}", text=t, label=l)
+            for i, (t, l) in df_val[[TEXT_COL_NAME, LABEL_COL_NAME]].iterrows()
+        ]
+        self.test_examples = [
+            InputExample(guid=f"test-{i}", text=t, label=l)
+            for i, (t, l) in df_test[[TEXT_COL_NAME, LABEL_COL_NAME]].iterrows()
+        ]
+
+        self.train_dataset = self.create_dataset(self.train_examples)
+        self.val_dataset = self.create_dataset(self.val_examples)
+        self.test_dataset = self.create_dataset(self.test_examples)
+
+        self.dataset_size = len(self.train_dataset)
+
+    def create_dataset(self, data: List[InputExample]) -> SequenceClassificationDataset:
+        return SequenceClassificationDataset(
+            data,
+            tokenizer=self.tokenizer,
+            max_seq_length=self.max_seq_length,
+            label_to_id=self.label2id,
+            # pin_memory=True
+        )
+
+    def create_dataloader(
+        self,
+        ds: SequenceClassificationDataset,
+        batch_size: int,
+        num_workers: int = 0,
+        shuffle: bool = False,
+    ) -> DataLoader:
+        return DataLoader(
+            ds,
+            collate_fn=InputFeaturesBatch,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            shuffle=shuffle,
+        )
+
+    def train_dataloader(self):
+        return self.create_dataloader(
+            self.train_dataset, self.train_batch_size, self.num_workers, shuffle=True
+        )
+
+    def val_dataloader(self):
+        return self.create_dataloader(
+            self.val_dataset, self.eval_batch_size, self.num_workers, shuffle=False
+        )
+
+    def test_dataloader(self):
+        return self.create_dataloader(
+            self.test_dataset, self.eval_batch_size, self.num_workers, shuffle=False
+        )
+
+    def total_steps(self) -> int:
+        """
+        The number of total training steps that will be run. Used for lr scheduler purposes.
+        """
+        num_devices = max(1, self.hparams.gpus)  # TODO: consider num_tpu_cores
+        effective_batch_size = (
+            self.hparams.train_batch_size
+            * self.hparams.accumulate_grad_batches
+            * num_devices
+        )
+        return (self.dataset_size / effective_batch_size) * self.hparams.max_epochs
 
     @staticmethod
     def add_model_specific_args(parent_parser):
-        """
-        Returns the text and the labels of the specified item
-        :param parent_parser: Application specific parser
-        :return: Returns the augmented arugument parser
-        """
         parser = ArgumentParser(parents=[parent_parser], add_help=False)
         parser.add_argument(
-            "--batch_size",
+            "--train_batch_size",
             type=int,
-            default=16,
-            metavar="N",
-            help="input batch size for training (default: 16)",
+            default=32,
+            help="input batch size for training (default: 32)",
+        )
+        parser.add_argument(
+            "--eval_batch_size",
+            type=int,
+            default=32,
+            help="input batch size for validation/test (default: 32)",
         )
         parser.add_argument(
             "--num_workers",
             type=int,
-            default=3,
+            default=4,
             metavar="N",
             help="number of workers (default: 3)",
         )
+        parser.add_argument(
+            "--max_seq_length",
+            default=256,
+            type=int,
+            help="The maximum total input sequence length after tokenization. Sequences longer "
+            "than this will be truncated, sequences shorter will be padded.",
+        )
+        parser.add_argument(
+            "--data_dir",
+            default="data",
+            type=str,
+            required=True,
+            help="The input data dir. Should contain the training files for the CoNLL-2003 NER task.",
+        )
+        parser.add_argument(
+            "--num_samples",
+            type=int,
+            default=15000,
+            metavar="N",
+            help="Number of samples to be used for training and evaluation steps (default: 15000) Maximum:100000",
+        )
         return parser
 
-    def create_data_loader(self, df, tokenizer, max_len, batch_size, num_workers):
-        """
-        Generic data loader function
-        :param df: Input dataframe
-        :param tokenizer: bert tokenizer
-        :param max_len: Max length of the news datapoint
-        :param batch_size: Batch size for training
-        :return: Returns the constructed dataloader
-        """
-        texts = df[TEXT_COL_NAME].to_numpy()
-        labels = df[LABEL_COL_NAME].to_numpy()
-        ds = DocCatDataset(
-            texts=texts,
-            labels=labels,
-            tokenizer=tokenizer,
-            max_length=max_len,
-        )
 
-        return DataLoader(
-            ds,
-            batch_size=batch_size,
-            num_workers=num_workers,
-        )
+class SequenceClassificationModule(pl.LightningModule):
+    """
+    Initialize a model and config for token-classification
+    """
 
-    def train_dataloader(self):
-        """
-        :return: output - Train data loader for the given input
-        """
-        self.train_data_loader = self.create_data_loader(
-            self.df_train,
-            self.tokenizer,
-            self.MAX_LEN,
-            self.args["batch_size"],
-            self.args["num_workers"],
-        )
-        return self.train_data_loader
+    def __init__(self, hparams: Union[Dict, Namespace]):
+        # NOTE: internal code may pass hparams as dict **kwargs
+        if isinstance(hparams, Dict):
+            hparams = Namespace(**hparams)
 
-    def val_dataloader(self):
-        """
-        :return: output - Validation data loader for the given input
-        """
-        self.val_data_loader = self.create_data_loader(
-            self.df_val,
-            self.tokenizer,
-            self.MAX_LEN,
-            self.args["batch_size"],
-            self.args["num_workers"],
-        )
-        return self.val_data_loader
-
-    def test_dataloader(self):
-        """
-        :return: output - Test data loader for the given input
-        """
-        self.test_data_loader = self.create_data_loader(
-            self.df_test,
-            self.tokenizer,
-            self.MAX_LEN,
-            self.args["batch_size"],
-            self.args["num_workers"],
-        )
-        return self.test_data_loader
-
-
-class BertNewsClassifier(pl.LightningModule):
-    def __init__(self, **kwargs):
-        """
-        Initializes the network, optimizer and scheduler
-        """
-        super(BertNewsClassifier, self).__init__()
-        self.PRE_TRAINED_MODEL_NAME = PRE_TRAINED_MODEL_NAME
-        self.bert_model = BertModel.from_pretrained(self.PRE_TRAINED_MODEL_NAME)
-        for param in self.bert_model.parameters():
-            param.requires_grad = False
-        self.drop = nn.Dropout(p=0.2)
-        # assigning labels
-        self.class_names = LABELS
-        n_classes = len(self.class_names)
-
-        self.fc1 = nn.Linear(self.bert_model.config.hidden_size, 512)
-        self.out = nn.Linear(512, n_classes)
-
+        num_labels = len(LABELS)
         self.scheduler = None
         self.optimizer = None
-        self.args = kwargs
 
-    def forward(self, input_ids, attention_mask):
-        """
-        :param input_ids: Input data
-        :param attention_maks: Attention mask value
-        :return: output - Type of news for the given news snippet
-        """
-        _, pooled_output = self.bert_model(
-            input_ids=input_ids, attention_mask=attention_mask
+        super().__init__()
+        # Enable to access arguments via self.hparams
+        self.save_hyperparameters(hparams)
+
+        self.step_count = 0
+        self.output_dir = Path(self.hparams.output_dir)
+        self.cache_dir = None
+        if self.hparams.cache_dir:
+            if not os.path.exists(self.hparams.cache_dir):
+                os.mkdir(self.hparams.cache_dir)
+            self.cache_dir = self.hparams.cache_dir
+
+        # AutoTokenizer
+        # trf>=4.0.0: PreTrainedTokenizerFast by default
+        # NOTE: AutoTokenizer doesn't load PreTrainedTokenizerFast...
+        self.tokenizer_name = self.hparams.model_name_or_path
+        self.tokenizer = BertTokenizerFast.from_pretrained(
+            self.tokenizer_name,
+            cache_dir=self.cache_dir,
         )
-        output = F.relu(self.fc1(pooled_output))
-        output = self.drop(output)
-        output = self.out(output)
-        return output
 
-    @staticmethod
-    def add_model_specific_args(parent_parser):
-        """
-        Returns the text and the label of the specified item
-        :param parent_parser: Application specific parser
-        :return: Returns the augmented arugument parser
-        """
-        parser = ArgumentParser(parents=[parent_parser], add_help=False)
-        parser.add_argument(
-            "--lr",
-            type=float,
-            default=0.001,
-            metavar="LR",
-            help="learning rate (default: 0.001)",
+        # AutoConfig
+        config_name = self.hparams.model_name_or_path
+        self.config: PretrainedConfig = BertConfig.from_pretrained(
+            config_name,
+            **({"num_labels": num_labels} if num_labels is not None else {}),
+            cache_dir=self.cache_dir,
         )
-        return parser
+        extra_model_params = (
+            "encoder_layerdrop",
+            "decoder_layerdrop",
+            "dropout",
+            "attention_dropout",
+        )
+        for p in extra_model_params:
+            if getattr(self.hparams, p, None):
+                assert hasattr(
+                    self.config, p
+                ), f"model config doesn't have a `{p}` attribute"
+                setattr(self.config, p, getattr(self.hparams, p, None))
 
-    def training_step(self, train_batch, batch_idx):
+        # AutoModelForTokenClassification
+        self.model: PreTrainedModel = BertForSequenceClassification.from_pretrained(
+            self.hparams.model_name_or_path,
+            from_tf=bool(".ckpt" in self.hparams.model_name_or_path),
+            config=self.config,
+            cache_dir=self.cache_dir,
+        )
+        # for param in self.model.parameters():
+        #     param.requires_grad = False
+
+    def forward(self, **inputs) -> SequenceClassifierOutput:
+        """ BertForSequenceClassification.forward(
+            input_ids=None,
+            attention_mask=None,
+            token_type_ids=None,
+            position_ids=None,
+            head_mask=None,
+            inputs_embeds=None,
+            labels=None,
+            output_attentions=None,
+            output_hidden_states=None,
+            return_dict=None,)
         """
-        Training the data as batches and returns training loss on each batch
-        :param train_batch Batch data
-        :param batch_idx: Batch indices
-        :return: output - Training loss
-        """
-        input_ids = train_batch[INPUT_IDS].to(self.device)
-        attention_mask = train_batch[ATTENTION_MASK].to(self.device)
-        labels = train_batch[LABEL_COL_NAME].to(self.device)
-        output = self.forward(input_ids, attention_mask)
-        loss = F.cross_entropy(output, labels)
+        return self.model(**inputs)
+
+    def training_step(self, train_batch: InputFeaturesBatch, batch_idx) -> Dict:
+        inputs = {
+            "input_ids": train_batch.input_ids,
+            "attention_mask": train_batch.attention_mask,
+            "labels": train_batch.label_ids,
+        }
+        output: SequenceClassifierOutput = self(**inputs)
+        loss = output.loss
         self.log("train_loss", loss)
         return {"loss": loss}
 
-    def test_step(self, test_batch, batch_idx):
-        """
-        Performs test and computes the accuracy of the model
-        :param test_batch: Batch data
-        :param batch_idx: Batch indices
-        :return: output - Testing accuracy
-        """
-        input_ids = test_batch[INPUT_IDS].to(self.device)
-        attention_mask = test_batch[ATTENTION_MASK].to(self.device)
-        labels = test_batch[LABEL_COL_NAME].to(self.device)
-        output = self.forward(input_ids, attention_mask)
-        _, y_hat = torch.max(output, dim=1)
-        test_acc = accuracy_score(y_hat.cpu(), labels.cpu())
+    def validation_step(self, val_batch: InputFeaturesBatch, batch_idx) -> Dict:
+        inputs = {
+            "input_ids": val_batch.input_ids,
+            "attention_mask": val_batch.attention_mask,
+            "labels": val_batch.label_ids,
+        }
+        output: SequenceClassifierOutput = self(**inputs)
+        loss = output.loss
+        # self.log("val_step_loss", loss)
+        return {"val_step_loss": loss.detach().cpu()}
+
+    def test_step(self, test_batch: InputFeaturesBatch, batch_idx) -> Dict:
+        inputs = {
+            "input_ids": test_batch.input_ids,
+            "attention_mask": test_batch.attention_mask,
+            "labels": test_batch.label_ids,
+        }
+        output: SequenceClassifierOutput = self(**inputs)
+        print(output.logits.shape)
+        _, y_hat = torch.max(output.logits, dim=1)  # values, indices
+        test_acc = accuracy_score(y_hat.cpu(), inputs["labels"].cpu())
         return {"test_acc": torch.tensor(test_acc)}
 
-    def validation_step(self, val_batch, batch_idx):
-        """
-        Performs validation of data in batches
-        :param val_batch: Batch data
-        :param batch_idx: Batch indices
-        :return: output - valid step loss
-        """
-
-        input_ids = val_batch[INPUT_IDS].to(self.device)
-        attention_mask = val_batch[ATTENTION_MASK].to(self.device)
-        labels = val_batch[LABEL_COL_NAME].to(self.device)
-        output = self.forward(input_ids, attention_mask)
-        loss = F.cross_entropy(output, labels)
-        return {"val_step_loss": loss}
-
     def validation_epoch_end(self, outputs):
-        """
-        Computes average validation accuracy
-        :param outputs: outputs after every epoch end
-        :return: output - average valid loss
-        """
         avg_loss = torch.stack([x["val_step_loss"] for x in outputs]).mean()
         self.log("val_loss", avg_loss, sync_dist=True)
 
     def test_epoch_end(self, outputs):
-        """
-        Computes average test accuracy score
-        :param outputs: outputs after every epoch end
-        :return: output - average test loss
-        """
         avg_test_acc = torch.stack([x["test_acc"] for x in outputs]).mean()
         self.log("avg_test_acc", avg_test_acc)
 
     def configure_optimizers(self):
-        """
-        Initializes the optimizer and learning rate scheduler
-        :return: output - Initialized optimizer and scheduler
-        """
-        self.optimizer = AdamW(self.parameters(), lr=self.args["lr"])
+        """Prepare optimizer and schedule (linear warmup and decay)"""
+        model = self.model
+        no_decay = ["bias", "LayerNorm.weight"]
+        optimizer_grouped_parameters = [
+            {
+                "params": [
+                    p
+                    for n, p in model.named_parameters()
+                    if not any(nd in n for nd in no_decay)
+                ],
+                "weight_decay": self.hparams.weight_decay,
+            },
+            {
+                "params": [
+                    p
+                    for n, p in model.named_parameters()
+                    if any(nd in n for nd in no_decay)
+                ],
+                "weight_decay": 0.0,
+            },
+        ]
+        if self.hparams.adafactor:
+            self.optimizer = Adafactor(
+                optimizer_grouped_parameters,
+                lr=self.hparams.learning_rate,
+                scale_parameter=False,
+                relative_step=False,
+            )
+        else:
+            self.optimizer = AdamW(
+                optimizer_grouped_parameters,
+                lr=self.hparams.learning_rate,
+                eps=self.hparams.adam_epsilon,
+            )
         self.scheduler = {
-            "scheduler": torch.optim.lr_scheduler.ReduceLROnPlateau(
+            "scheduler": ReduceLROnPlateau(
                 self.optimizer,
                 mode="min",
                 factor=0.2,
@@ -416,69 +547,193 @@ class BertNewsClassifier(pl.LightningModule):
             ),
             "monitor": "val_loss",
         }
+
         return [self.optimizer], [self.scheduler]
 
+    @pl.utilities.rank_zero_only
+    def on_save_checkpoint(self, checkpoint: Dict[str, Any]):
+        save_path = self.output_dir.joinpath("best_tfmr")
+        self.model.config.save_step = self.step_count
+        self.model.save_pretrained(save_path)
+        self.tokenizer.save_pretrained(save_path)
 
-def make_trainer(argparse_args):
+    @staticmethod
+    def add_model_specific_args(parent_parser):
+        parser = ArgumentParser(parents=[parent_parser], add_help=False)
+
+        parser.add_argument(
+            "--encoder_layerdrop",
+            type=float,
+            help="Encoder layer dropout probability (Optional). Goes into model.config",
+        )
+        parser.add_argument(
+            "--decoder_layerdrop",
+            type=float,
+            help="Decoder layer dropout probability (Optional). Goes into model.config",
+        )
+        parser.add_argument(
+            "--dropout",
+            type=float,
+            help="Dropout probability (Optional). Goes into model.config",
+        )
+        parser.add_argument(
+            "--attention_dropout",
+            type=float,
+            help="Attention dropout probability (Optional). Goes into model.config",
+        )
+        parser.add_argument(
+            "--weight_decay",
+            default=0.0,
+            type=float,
+            help="Weight decay if we apply some.",
+        )
+        parser.add_argument(
+            "--learning_rate",
+            default=5e-5,
+            type=float,
+            help="The initial learning rate for Adam.",
+        )
+        parser.add_argument(
+            "--adam_epsilon",
+            default=1e-8,
+            type=float,
+            help="Epsilon for Adam optimizer.",
+        )
+        parser.add_argument("--adafactor", action="store_true")
+        return parser
+
+
+class LoggingCallback(pl.Callback):
+    # def on_batch_end(self, trainer, pl_module):
+    #     lr_scheduler = trainer.lr_schedulers[0]["scheduler"]
+    #     # lrs = {f"lr_group_{i}": lr for i, lr in enumerate(lr_scheduler.get_lr())}
+    #     # pl_module.logger.log_metrics(lrs)
+    #     pl_module.logger.log_metrics({"last_lr": lr_scheduler._last_lr})
+
+    def on_validation_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        rank_zero_info("***** Validation results *****")
+        metrics = trainer.callback_metrics
+        # Log results
+        for key in sorted(metrics):
+            rank_zero_info("{} = {}\n".format(key, str(metrics[key])))
+
+    def on_test_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        rank_zero_info("***** Test results *****")
+        metrics = trainer.callback_metrics
+        # Log and save results to file
+        output_test_results_file = os.path.join(
+            pl_module.hparams.output_dir, "test_results.txt"
+        )
+        with open(output_test_results_file, "w") as writer:
+            for key in sorted(metrics):
+                rank_zero_info("{} = {}\n".format(key, str(metrics[key])))
+                writer.write("{} = {}\n".format(key, str(metrics[key])))
+
+
+def make_trainer(argparse_args: Namespace):
+    """
+    Prepare pl.Trainer with callbacks and args
+    """
+
     early_stopping = EarlyStopping(monitor="val_loss", mode="min", verbose=True)
 
     checkpoint_callback = ModelCheckpoint(
-        filepath=os.getcwd(),
+        dirpath=argparse_args.output_dir,
+        filename="checkpoint-{epoch}-{val_loss:.2f}",
         save_top_k=1,
         verbose=True,
         monitor="val_loss",
         mode="min",
-        prefix="",
     )
     lr_logger = LearningRateMonitor()
+    logging_callback = LoggingCallback()
+
+    train_params = {}
+    if args.gpus > 1:
+        train_params["distributed_backend"] = "ddp"
+    train_params["accumulate_grad_batches"] = args.accumulate_grad_batches
 
     trainer = pl.Trainer.from_argparse_args(
         argparse_args,
-        callbacks=[lr_logger, early_stopping],
-        checkpoint_callback=checkpoint_callback,
+        callbacks=[lr_logger, early_stopping, checkpoint_callback, logging_callback],
+        **train_params,
     )
-    return trainer
+    return trainer, checkpoint_callback
 
 
-def make_model_and_dm(argparse_args):
+def make_model_and_dm(argparse_args: Namespace):
     """
     Prepare pl.LightningDataModule and pl.LightningModule
     """
-    dict_args = vars(argparse_args)
-
-    if "accelerator" in dict_args:
-        if dict_args["accelerator"] == "None":
-            dict_args["accelerator"] = None
-    dm = BertJapaneseDataModule(**dict_args)
+    dm = SequenceClassificationDataModule(argparse_args)
     dm.prepare_data()
     dm.setup(stage="fit")
 
-    model = BertNewsClassifier(**dict_args)
+    model = SequenceClassificationModule(argparse_args)
 
     return model, dm
 
 
 if __name__ == "__main__":
-    parser = ArgumentParser(description="Japanese Bert News Classifier Example")
+
+    parser = ArgumentParser(description="Transformers Document Classifier")
 
     parser.add_argument(
-        "--num_samples",
-        type=int,
-        default=15000,
-        metavar="N",
-        help="Number of samples to be used for training and evaluation steps (default: 15000) Maximum:100000",
+        "--model_name_or_path",
+        default=None,
+        type=str,
+        required=True,
+        help="Path to pretrained model or model identifier from huggingface.co/models",
+    )
+    parser.add_argument(
+        "--output_dir",
+        default=None,
+        type=str,
+        required=True,
+        help="The output directory where the model predictions and checkpoints will be written.",
+    )
+    parser.add_argument(
+        "--cache_dir",
+        default="",
+        type=str,
+        help="Where do you want to store the pre-trained models downloaded from huggingface.co",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42, help="random seed for initialization"
+    )
+    parser.add_argument(
+        "--do_train", action="store_true", help="Whether to run training."
+    )
+    parser.add_argument(
+        "--do_predict",
+        action="store_true",
+        help="Whether to run predictions on the test set.",
     )
 
     parser = pl.Trainer.add_argparse_args(parent_parser=parser)
-    parser = BertNewsClassifier.add_model_specific_args(parent_parser=parser)
-    parser = BertJapaneseDataModule.add_model_specific_args(parent_parser=parser)
+    parser = SequenceClassificationModule.add_model_specific_args(parent_parser=parser)
+    parser = SequenceClassificationDataModule.add_model_specific_args(
+        parent_parser=parser
+    )
+    args = parser.parse_args()
+
+    # init
+    pl.seed_everything(args.seed)
+    random.seed(args.seed)
+    os.environ["PYTHONHASHSEED"] = str(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    Path(args.output_dir).mkdir(exist_ok=True)
 
     mlflow.pytorch.autolog()
 
-    args = parser.parse_args()
     model, dm = make_model_and_dm(args)
-    trainer = make_trainer(args)
+    trainer, checkpoint_callback = make_trainer(args)
 
     # MLflow Autologging is performed here
     trainer.fit(model, dm)
-    trainer.test()
+
+    if args.do_predict:
+        # NOTE: load the best checkpoint automatically
+        trainer.test()
