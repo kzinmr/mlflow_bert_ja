@@ -1,26 +1,27 @@
 import os
 import random
+import tarfile
 from argparse import ArgumentParser
+from pathlib import Path
+from typing import Final, Optional, Tuple
+
 import mlflow.pytorch
 import numpy as np
 import pandas as pd
 import pytorch_lightning as pl
+import requests
 import torch
 import torch.nn.functional as F
 from pytorch_lightning.callbacks import (
     EarlyStopping,
-    ModelCheckpoint,
     LearningRateMonitor,
+    ModelCheckpoint
 )
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
 from torch import nn
-from torch.utils.data import Dataset, DataLoader
-from transformers import BertModel, BertTokenizer, AdamW
-from typing import Final, Optional, Tuple
-from pathlib import Path
-import requests
-import tarfile
+from torch.utils.data import DataLoader, Dataset
+from transformers import AdamW, BertModel, BertTokenizer
 
 TEXT_COL_NAME: Final[str] = "text"
 LABEL_COL_NAME: Final[str] = "label"
@@ -440,6 +441,9 @@ def make_trainer(argparse_args):
 
 
 def make_model_and_dm(argparse_args):
+    """
+    Prepare pl.LightningDataModule and pl.LightningModule
+    """
     dict_args = vars(argparse_args)
 
     if "accelerator" in dict_args:
@@ -469,12 +473,12 @@ if __name__ == "__main__":
     parser = BertNewsClassifier.add_model_specific_args(parent_parser=parser)
     parser = BertJapaneseDataModule.add_model_specific_args(parent_parser=parser)
 
-    # Autologging is performed when the fit method of pl.Trainer() is called.
     mlflow.pytorch.autolog()
 
     args = parser.parse_args()
     model, dm = make_model_and_dm(args)
     trainer = make_trainer(args)
 
+    # MLflow Autologging is performed here
     trainer.fit(model, dm)
     trainer.test()

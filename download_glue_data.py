@@ -24,7 +24,6 @@ import sys
 import urllib.request
 import zipfile
 
-
 TASKS = [
     "CoLA",
     "SST",

@@ -11,41 +11,42 @@ from typing import Any, Dict, List, Optional, Set, TextIO, Union
 import mlflow.pytorch
 import numpy as np
 import pytorch_lightning as pl
+import requests
 import torch
-
 from pytorch_lightning.callbacks import (
     EarlyStopping,
-    ModelCheckpoint,
     LearningRateMonitor,
+    ModelCheckpoint
 )
 from pytorch_lightning.utilities import rank_zero_info
-from seqeval.metrics import accuracy_score, f1_score, precision_score, recall_score
+from seqeval.metrics import (
+    accuracy_score,
+    f1_score,
+    precision_score,
+    recall_score
+)
 from seqeval.scheme import BILOU
-from torch.nn import CrossEntropyLoss
+from tokenizers import Encoding
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Dataset
-
-from tokenizers import Encoding
-from transformers import (
+from transformers import (  # AutoConfig,; AutoModelForTokenClassification,; AutoTokenizer,
     AdamW,
-    # AutoConfig,
-    # AutoModelForTokenClassification,
-    # AutoTokenizer,
+    BatchEncoding,
     BertConfig,
     BertForTokenClassification,
     BertTokenizerFast,
-    BatchEncoding,
     PretrainedConfig,
     PreTrainedModel,
-    PreTrainedTokenizerFast,
+    PreTrainedTokenizerFast
 )
-from transformers.optimization import Adafactor
 from transformers.modeling_outputs import TokenClassifierOutput
-import requests
+from transformers.optimization import Adafactor
 
+# huggingface/tokenizers: Disabling parallelism to avoid deadlocks.
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 logger = logging.getLogger(__name__)
-PAD_TOKEN_LABEL_ID = CrossEntropyLoss().ignore_index
+PAD_TOKEN_LABEL_ID = -100
 IntList = List[int]
 IntListList = List[IntList]
 StrList = List[str]
@@ -513,7 +514,6 @@ class TokenClassificationDataModule(pl.LightningDataModule):
         split the data into train, test, validation data
         but here we assume the dataset is splitted in prior
         """
-        pass
 
     def get_dataloader(
         self, ds: NERDataset, bs: int, num_workers: int = 0, shuffle: bool = False
@@ -1101,7 +1101,7 @@ if __name__ == "__main__":
 
     Path(args.output_dir).mkdir(exist_ok=True)
 
-    # mlflow.pytorch.autolog()
+    mlflow.pytorch.autolog()
 
     model, dm = make_model_and_dm(parser)
     trainer, checkpoint_callback = make_trainer(parser)

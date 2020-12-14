@@ -3,22 +3,26 @@ import glob
 import logging
 import os
 from argparse import Namespace
+from dataclasses import dataclass
+from enum import Enum
+from typing import List, Optional, TextIO, Union
 
 import numpy as np
 import torch
-from seqeval.metrics import accuracy_score, f1_score, precision_score, recall_score
+from seqeval.metrics import (
+    accuracy_score,
+    f1_score,
+    precision_score,
+    recall_score
+)
 from torch.nn import CrossEntropyLoss
 from torch.utils.data import DataLoader, TensorDataset
+from transformers import PreTrainedTokenizer
 
 from lightning_base import BaseTransformer, add_generic_args, generic_train
 
 # from importlib import import_module
 # from utils_ner import TokenClassificationTask
-
-from dataclasses import dataclass
-from enum import Enum
-from typing import List, Optional, TextIO, Union
-from transformers import PreTrainedTokenizer
 
 
 logger = logging.getLogger(__name__)

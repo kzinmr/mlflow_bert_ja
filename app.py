@@ -1,5 +1,6 @@
 import os
 from argparse import ArgumentParser
+
 import mlflow.pytorch
 import numpy as np
 import pandas as pd
@@ -8,16 +9,16 @@ import torch
 import torch.nn.functional as F
 from pytorch_lightning.callbacks import (
     EarlyStopping,
-    ModelCheckpoint,
     LearningRateMonitor,
+    ModelCheckpoint
 )
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
 from torch import nn
-from torch.utils.data import Dataset, DataLoader
-from transformers import BertModel, BertTokenizer, AdamW
-from torchtext.utils import download_from_url, extract_archive
+from torch.utils.data import DataLoader, Dataset
 from torchtext.datasets.text_classification import URLS
+from torchtext.utils import download_from_url, extract_archive
+from transformers import AdamW, BertModel, BertTokenizer
 
 
 class AGNewsDataset(Dataset):

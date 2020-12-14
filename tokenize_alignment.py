@@ -1,15 +1,13 @@
 # https://github.com/LightTag/sequence-labeling-with-transformers
 import itertools
 from dataclasses import dataclass
-from typing import List, Any
-from typing_extensions import TypedDict
+from typing import Any, List
 
 import torch
 from tokenizers import Encoding
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerFast
-
-
+from typing_extensions import TypedDict
 
 IntList = List[int]  # A list of token_ids
 IntListList = List[IntList]  # A List of List of token_ids, e.g. a Batch
@@ -20,6 +18,7 @@ class TrainingExample:
     input_ids: IntList
     attention_masks: IntList
     labels: IntList
+
 
 class TraingingBatch:
     def __getitem__(self, item):
@@ -39,6 +38,7 @@ class TraingingBatch:
         self.input_ids = torch.LongTensor(input_ids)
         self.attention_masks = torch.LongTensor(masks)
         self.labels = torch.LongTensor(labels)
+
 
 def align_tokens_and_annotations_bilou(tokenized: Encoding, annotations):
     tokens = tokenized.tokens
@@ -75,6 +75,7 @@ def align_tokens_and_annotations_bilou(tokenized: Encoding, annotations):
                 aligned_labels[token_ix] = f"{prefix}-{anno['label']}"
     return aligned_labels
 
+
 class LabelSet:
     def __init__(self, labels: List[str]):
         self.labels_to_id = {}
@@ -95,16 +96,19 @@ class LabelSet:
 
 
 class ExpectedAnnotationShape(TypedDict):
-    start:int
-    end:int
-    label :str
+    start: int
+    end: int
+    label: str
+
 
 class ExpectedDataItemShape(TypedDict):
-    content:str # The Text to be annotated
-    annotations :List[ExpectedAnnotationShape]
+    content: str  # The Text to be annotated
+    annotations: List[ExpectedAnnotationShape]
+
 
 class TrainingDataset(Dataset):
-    ''''''
+    """"""
+
     def __init__(
         self,
         data: Any,
@@ -138,7 +142,6 @@ class TrainingDataset(Dataset):
 
         ###MAKE A LIST OF TRAINING EXAMPLES. (This is where we add padding)
         self.training_examples: List[TrainingExample] = []
-        empty_label_id = "O"
         for encoding, label in zip(tokenized_batch.encodings, aligned_labels):
             length = len(label)  # How long is this sequence
             for start in range(0, length, self.window_stride):
@@ -173,27 +176,32 @@ class TrainingDataset(Dataset):
         return self.training_examples[idx]
 
 
-if __name__=='__main__':
-    from torch.utils.data.dataloader import DataLoader
-    from transformers import BertForTokenClassification, AdamW
-    from transformers import BertTokenizerFast,  BatchEncoding
+if __name__ == "__main__":
     from tokenizers import Encoding
+    from torch.utils.data.dataloader import DataLoader
+    from transformers import (
+        AdamW,
+        BatchEncoding,
+        BertForTokenClassification,
+        BertTokenizerFast
+    )
 
     # input format
     text = "株式会社XのNLP太郎"
     annotations = [
-        dict(start=0,end=5,text="株式会社X",label="Org"),
-        dict(start=6,end=11,text="NLP太郎",label="Person"),
+        dict(start=0, end=5, text="株式会社X", label="Org"),
+        dict(start=6, end=11, text="NLP太郎", label="Person"),
     ]
     for anno in annotations:
-        print(text[anno['start']:anno['end']], anno['label'])
+        print(text[anno["start"] : anno["end"]], anno["label"])
 
-    example = {'annotations': annotations, 'content': text,}
-    
+    example = {
+        "annotations": annotations,
+        "content": text,
+    }
 
-    PRETRAINED_MODEL = 'cl-tohoku/bert-base-japanese'
+    PRETRAINED_MODEL = "cl-tohoku/bert-base-japanese"
     tokenizer = BertTokenizerFast.from_pretrained(PRETRAINED_MODEL)
-
 
     # tokenize & alignment demo
     tokenized_batch: BatchEncoding = tokenizer(example["content"])
