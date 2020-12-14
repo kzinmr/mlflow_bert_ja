@@ -41,8 +41,10 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 IntList = List[int]
 IntListList = List[List[int]]
+StrList = List[str]
 TEXT_COL_NAME: str = "text"
 LABEL_COL_NAME: str = "label"
+
 
 class LABELS(Enum):
     sports_watch = "sports-watch"
@@ -115,29 +117,27 @@ def make_livedoor_corpus_dataset(data_dir: str = "./data") -> pd.DataFrame:
 
 
 class SequenceClassificationDataset(Dataset):
+    """
+    Build feature dataset so that the model can load
+    """
+
     def __init__(
         self,
         data: List[InputExample],
         tokenizer: PreTrainedTokenizerFast,
-        max_seq_length: int,
-        label_to_id: Dict[str, int]
+        label_to_id: Dict[str, int],
+        tokens_per_batch: int = 32,
     ):
-        """
-        Performs initialization of tokenizer
-        :param texts: document texts
-        :param labels: labels
-        :param tokenizer: bert tokenizer
-        :param max_seq_length: maximum length of the document text
-        """
-        self.examples = data
-        texts = [ex.text for ex in self.examples]
-        labels = [ex.label for ex in self.examples if ex.label]
+        self.features: List[InputFeatures] = []
+        self.examples: List[InputExample] = data
+        texts: StrList = [ex.text for ex in self.examples]
+        labels: StrList = [ex.label for ex in self.examples if ex.label]
 
         self.encodings = [
             tokenizer.encode_plus(
                 text,
                 add_special_tokens=True,
-                max_length=max_seq_length,
+                max_length=tokens_per_batch,
                 return_token_type_ids=False,
                 padding="max_length",
                 return_attention_mask=True,
@@ -160,7 +160,7 @@ class SequenceClassificationDataset(Dataset):
                 InputFeatures(
                     input_ids=encoding.input_ids.flatten().tolist(),
                     attention_mask=encoding.attention_mask.flatten().tolist(),
-                    label_ids=None
+                    label_ids=None,
                 )
                 for encoding in self.encodings
             ]
@@ -171,6 +171,7 @@ class SequenceClassificationDataset(Dataset):
 
     def __getitem__(self, idx) -> InputFeatures:
         return self.features[idx]
+
 
 class InputFeaturesBatch:
     def __init__(self, features: List[InputFeatures]):
@@ -206,12 +207,15 @@ class SequenceClassificationDataModule(pl.LightningDataModule):
 
     def __init__(self, hparams: Namespace):
         self.tokenizer: PreTrainedTokenizerFast
-        self.df_train: pd.DataFrame
-        self.df_val: pd.DataFrame
-        self.df_test: pd.DataFrame
+        self.train_examples: List[InputExample]
+        self.dev_examples: List[InputExample]
+        self.test_examples: List[InputExample]
+        self.train_dataset: SequenceClassificationDataset
+        self.dev_dataset: SequenceClassificationDataset
+        self.test_dataset: SequenceClassificationDataset
         self.df_org: pd.DataFrame
         self.df_use: pd.DataFrame
-        self.label2id: Dict[str, int]
+        self.label_to_id: Dict[str, int]
 
         super().__init__()
         self.max_seq_length = hparams.max_seq_length
@@ -221,7 +225,6 @@ class SequenceClassificationDataModule(pl.LightningDataModule):
         self.data_dir = hparams.data_dir
         if not os.path.exists(self.data_dir):
             os.mkdir(self.data_dir)
-
         self.tokenizer_name = hparams.model_name_or_path
         self.train_batch_size = hparams.train_batch_size
         self.eval_batch_size = hparams.eval_batch_size
@@ -233,7 +236,10 @@ class SequenceClassificationDataModule(pl.LightningDataModule):
         Downloads the data and prepare the tokenizer
         """
         self.tokenizer = BertTokenizerFast.from_pretrained(
-            self.tokenizer_name, cache_dir=self.cache_dir
+            self.tokenizer_name,
+            cache_dir=self.cache_dir,
+            tokenize_chinese_chars=False,
+            strip_accents=False,
         )
         df = make_livedoor_corpus_dataset(self.data_dir)
         self.df_org = df
@@ -241,8 +247,8 @@ class SequenceClassificationDataModule(pl.LightningDataModule):
         # df.sample(frac=1)
         if self.num_samples > 0:
             df = df.iloc[: self.num_samples]
-        # label2id =  {k: v for v, k in enumerate(LABELS)}
-        self.label2id = {
+        # label_to_id =  {k: v for v, k in enumerate(LABELS)}
+        self.label_to_id = {
             k: v for v, k in enumerate(sorted(set(df[LABEL_COL_NAME].values.tolist())))
         }
         self.df_use = df
@@ -285,14 +291,14 @@ class SequenceClassificationDataModule(pl.LightningDataModule):
     def create_dataset(self, data: List[InputExample]) -> SequenceClassificationDataset:
         return SequenceClassificationDataset(
             data,
-            tokenizer=self.tokenizer,
-            max_seq_length=self.max_seq_length,
-            label_to_id=self.label2id,
+            self.tokenizer,
+            self.label_to_id,
+            self.max_seq_length,
             # pin_memory=True
         )
 
+    @staticmethod
     def create_dataloader(
-        self,
         ds: SequenceClassificationDataset,
         batch_size: int,
         num_workers: int = 0,
@@ -390,8 +396,6 @@ class SequenceClassificationModule(pl.LightningModule):
             hparams = Namespace(**hparams)
 
         num_labels = len(LABELS)
-        self.scheduler = None
-        self.optimizer = None
 
         super().__init__()
         # Enable to access arguments via self.hparams
@@ -412,6 +416,8 @@ class SequenceClassificationModule(pl.LightningModule):
         self.tokenizer = BertTokenizerFast.from_pretrained(
             self.tokenizer_name,
             cache_dir=self.cache_dir,
+            tokenize_chinese_chars=False,
+            strip_accents=False,
         )
 
         # AutoConfig
@@ -428,38 +434,39 @@ class SequenceClassificationModule(pl.LightningModule):
             "attention_dropout",
         )
         for p in extra_model_params:
-            if getattr(self.hparams, p, None):
-                assert hasattr(
-                    self.config, p
-                ), f"model config doesn't have a `{p}` attribute"
+            if getattr(self.hparams, p, None) and hasattr(self.config, p):
                 setattr(self.config, p, getattr(self.hparams, p, None))
 
-        # AutoModelForTokenClassification
+        # AutoModelForSequenceClassification
         self.model: PreTrainedModel = BertForSequenceClassification.from_pretrained(
             self.hparams.model_name_or_path,
             from_tf=bool(".ckpt" in self.hparams.model_name_or_path),
             config=self.config,
             cache_dir=self.cache_dir,
         )
-        # for param in self.model.parameters():
-        #     param.requires_grad = False
+
+        self.scheduler = None
+        self.optimizer = None
 
     def forward(self, **inputs) -> SequenceClassifierOutput:
-        """ BertForSequenceClassification.forward(
-            input_ids=None,
-            attention_mask=None,
-            token_type_ids=None,
-            position_ids=None,
-            head_mask=None,
-            inputs_embeds=None,
-            labels=None,
-            output_attentions=None,
-            output_hidden_states=None,
-            return_dict=None,)
+        """BertForSequenceClassification.forward(
+        input_ids=None,
+        attention_mask=None,
+        token_type_ids=None,
+        position_ids=None,
+        head_mask=None,
+        inputs_embeds=None,
+        labels=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,)
         """
         return self.model(**inputs)
 
-    def training_step(self, train_batch: InputFeaturesBatch, batch_idx) -> Dict:
+    def training_step(
+        self, train_batch: InputFeaturesBatch, batch_idx
+    ) -> Dict[str, torch.Tensor]:
+        # .to(self.device) is not necessary with pl.Traner
         inputs = {
             "input_ids": train_batch.input_ids,
             "attention_mask": train_batch.attention_mask,
@@ -470,7 +477,10 @@ class SequenceClassificationModule(pl.LightningModule):
         self.log("train_loss", loss)
         return {"loss": loss}
 
-    def validation_step(self, val_batch: InputFeaturesBatch, batch_idx) -> Dict:
+    def validation_step(
+        self, val_batch: InputFeaturesBatch, batch_idx
+    ) -> Dict[str, torch.Tensor]:
+        # .to(self.device) is not necessary with pl.Traner
         inputs = {
             "input_ids": val_batch.input_ids,
             "attention_mask": val_batch.attention_mask,
@@ -479,25 +489,27 @@ class SequenceClassificationModule(pl.LightningModule):
         output: SequenceClassifierOutput = self(**inputs)
         loss = output.loss
         # self.log("val_step_loss", loss)
-        return {"val_step_loss": loss.detach().cpu()}
+        return {"val_step_loss": loss}
 
-    def test_step(self, test_batch: InputFeaturesBatch, batch_idx) -> Dict:
+    def test_step(
+        self, test_batch: InputFeaturesBatch, batch_idx
+    ) -> Dict[str, torch.Tensor]:
+        # .to(self.device) is not necessary with pl.Traner
         inputs = {
             "input_ids": test_batch.input_ids,
             "attention_mask": test_batch.attention_mask,
             "labels": test_batch.label_ids,
         }
         output: SequenceClassifierOutput = self(**inputs)
-        print(output.logits.shape)
         _, y_hat = torch.max(output.logits, dim=1)  # values, indices
-        test_acc = accuracy_score(y_hat.cpu(), inputs["labels"].cpu())
-        return {"test_acc": torch.tensor(test_acc)}
+        test_acc = accuracy_score(y_hat.cpu(), inputs["labels"].detach().cpu())
+        return {"test_acc": torch.Tensor(test_acc)}
 
-    def validation_epoch_end(self, outputs):
+    def validation_epoch_end(self, outputs: List[Dict[str, torch.Tensor]]):
         avg_loss = torch.stack([x["val_step_loss"] for x in outputs]).mean()
         self.log("val_loss", avg_loss, sync_dist=True)
 
-    def test_epoch_end(self, outputs):
+    def test_epoch_end(self, outputs: List[Dict[str, torch.Tensor]]):
         avg_test_acc = torch.stack([x["test_acc"] for x in outputs]).mean()
         self.log("avg_test_acc", avg_test_acc)
 

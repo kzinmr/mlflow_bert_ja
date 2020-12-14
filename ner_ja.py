@@ -84,7 +84,6 @@ class TokenLabelExample:
 class InputFeatures:
     input_ids: IntList
     attention_mask: IntList
-    token_type_ids: Optional[IntList] = None
     label_ids: Optional[IntList] = None
 
 
@@ -128,25 +127,20 @@ def bio2biolu(lines: StrList, label_idx: int = -1, delimiter: str = "\t") -> Str
             tag_type = current_label[2:]
             iob = current_label[0]
 
-            # O -> O
-            # (B,I) -> B
-            # (B,O)|(B,B)(B,None) -> U
-            # (I,I) -> I
-            # (I,B)(I,O)(I,None) -> L
-            tpl = (iob, next_iob)
+            iob_transition = (iob, next_iob)
             current_iob = iob
-            if tpl == ("B", "I"):
+            if iob_transition == ("B", "I"):
                 current_iob = "B"
-            elif tpl == ("I", "I"):
+            elif iob_transition == ("I", "I"):
                 current_iob = "I"
-            elif tpl in {("B", "O"), ("B", "B"), ("B", None)}:
+            elif iob_transition in {("B", "O"), ("B", "B"), ("B", None)}:
                 current_iob = "U"
-            elif tpl in {("I", "B"), ("I", "O"), ("I", None)}:
+            elif iob_transition in {("I", "B"), ("I", "O"), ("I", None)}:
                 current_iob = "L"
             elif iob == "O":
                 current_iob = "O"
             else:
-                logger.warning(f"Invalid BIO transition: {tpl}")
+                logger.warning(f"Invalid BIO transition: {iob_transition}")
                 if iob not in set("BIOLU"):
                     current_iob = "O"
             biolu = f"{current_iob}-{tag_type}" if current_iob != "O" else "O"
@@ -252,7 +246,7 @@ def convert_spandata(examples: List[TokenLabelExample]) -> List[StringSpanExampl
 
 class LabelTokenAligner:
     """
-    Align token-wise labels with subtokens
+    Align token-wise BIOLU-labels with subtokens
     """
 
     def __init__(self, labels_path: str):
@@ -270,33 +264,32 @@ class LabelTokenAligner:
     def align_tokens_and_annotations_bilou(
         tokenized: Encoding, annotations: List[SpanAnnotation]
     ) -> StrList:
+        """Make subtoken-wise BIOLU-labels aligned with given subtokens
+        :param tokenized: output of PreTrainedTokenizerFast
+        :param annotations: annotations of string span format
+        """
         aligned_labels = ["O"] * len(
             tokenized.tokens
         )  # Make a list to store our labels the same length as our tokens
         for anno in annotations:
-            annotation_token_ix_set: Set[
-                int
-            ] = set()  # A set that stores the token indices of the annotation
+            annotation_token_ix_set: Set[int] = set()
             for char_ix in range(anno.start, anno.end):
                 token_ix = tokenized.char_to_token(char_ix)
                 if token_ix is not None:
                     annotation_token_ix_set.add(token_ix)
             if len(annotation_token_ix_set) == 1:
-                # If there is only one token
                 token_ix = annotation_token_ix_set.pop()
-                prefix = "U"  # This annotation spans one token so is prefixed with U for unique
+                prefix = "U"
                 aligned_labels[token_ix] = f"{prefix}-{anno.label}"
-
             else:
-
                 last_token_in_anno_ix = len(annotation_token_ix_set) - 1
                 for num, token_ix in enumerate(sorted(annotation_token_ix_set)):
                     if num == 0:
                         prefix = "B"
                     elif num == last_token_in_anno_ix:
-                        prefix = "L"  # Its the last token
+                        prefix = "L"
                     else:
-                        prefix = "I"  # We're inside of a multi token annotation
+                        prefix = "I"
                     aligned_labels[token_ix] = f"{prefix}-{anno.label}"
         return aligned_labels
 
@@ -318,37 +311,29 @@ class TokenClassificationDataset(Dataset):
     def __init__(
         self,
         data: List[StringSpanExample],
-        label_token_aligner: LabelTokenAligner,
         tokenizer: PreTrainedTokenizerFast,
+        label_token_aligner: LabelTokenAligner,
         tokens_per_batch: int = 32,
     ):
         self.features: List[InputFeatures] = []
         self.examples: List[TokenLabelExample] = []
+        guids: StrList = [ex.guid for ex in data]
+        texts: StrList = [ex.content for ex in data]
+        annotations: List[List[SpanAnnotation]] = [ex.annotations for ex in data]
 
-        self.label_token_aligner = label_token_aligner
-        self.tokenizer = tokenizer
-        pad_token_type_id = tokenizer.pad_token_type_id
-        pad_token_id = tokenizer.pad_token_id
-
-        self.guids: StrList = [ex.guid for ex in data]
-        self.texts: StrList = [ex.content for ex in data]
-        self.annotations: List[List[SpanAnnotation]] = [ex.annotations for ex in data]
-
-        # TOKENIZATION INTO SUBWORD
+        # tokenize text into subwords
         # NOTE: add_special_tokens=True is unnecessary for NER (ok?)
-        tokenized_batch: BatchEncoding = self.tokenizer(
-            self.texts, add_special_tokens=False
-        )
+        tokenized_batch: BatchEncoding = tokenizer(texts, add_special_tokens=False)
         encodings: List[Encoding] = tokenized_batch.encodings
-        # LABEL ALIGNMENT
+        # align word-wise labels with subwords
         aligned_label_ids: IntListList = list(
             starmap(
                 label_token_aligner.align_labels_with_tokens,
-                zip(encodings, self.annotations),
+                zip(encodings, annotations),
             )
         )
-        # PADDING & REGISTER FEATURES
-        for guid, encoding, label_ids in zip(self.guids, encodings, aligned_label_ids):
+        # perform manual padding and register features
+        for guid, encoding, label_ids in zip(guids, encodings, aligned_label_ids):
             seq_length = len(label_ids)
             for start in range(0, seq_length, tokens_per_batch):
                 end = min(start + tokens_per_batch, seq_length)
@@ -356,17 +341,13 @@ class TokenClassificationDataset(Dataset):
                 self.features.append(
                     InputFeatures(
                         input_ids=encoding.ids[start:end]
-                        + [pad_token_id] * n_padding_to_add,
+                        + [tokenizer.pad_token_id] * n_padding_to_add,
                         label_ids=(
                             label_ids[start:end]
                             + [PAD_TOKEN_LABEL_ID] * n_padding_to_add
                         ),
                         attention_mask=(
                             encoding.attention_mask[start:end] + [0] * n_padding_to_add
-                        ),
-                        token_type_ids=(
-                            encoding.type_ids[start:end]
-                            + [pad_token_type_id] * n_padding_to_add
                         ),
                     )
                 )
@@ -389,25 +370,19 @@ class InputFeaturesBatch:
     def __init__(self, features: List[InputFeatures]):
         self.input_ids: torch.Tensor
         self.attention_masks: torch.Tensor
-        self.token_type_ids: Optional[torch.Tensor]
         self.label_ids: Optional[torch.Tensor]
 
         self.n_features = len(features)
         input_ids: IntListList = []
         masks: IntListList = []
-        token_type_ids: IntListList = []
         label_ids: IntListList = []
         for f in features:
             input_ids.append(f.input_ids)
             masks.append(f.attention_mask)
-            if f.token_type_ids is not None:
-                token_type_ids.append(f.token_type_ids)
             if f.label_ids is not None:
                 label_ids.append(f.label_ids)
         self.input_ids = torch.LongTensor(input_ids)
         self.attention_mask = torch.LongTensor(masks)
-        if token_type_ids:
-            self.token_type_ids = torch.LongTensor(token_type_ids)
         if label_ids:
             self.label_ids = torch.LongTensor(label_ids)
 
@@ -416,6 +391,7 @@ class InputFeaturesBatch:
 
     def __getitem__(self, item):
         return getattr(self, item)
+
 
 class TokenClassificationDataModule(pl.LightningDataModule):
     """
@@ -448,7 +424,6 @@ class TokenClassificationDataModule(pl.LightningDataModule):
         self.num_workers = hparams.num_workers
         self.num_samples = hparams.num_samples
         self.labels_path = hparams.labels
-        # is_xlnet = bool(model_type in ["xlnet"])
 
     def prepare_data(self):
         """
@@ -459,6 +434,8 @@ class TokenClassificationDataModule(pl.LightningDataModule):
         self.tokenizer = BertTokenizerFast.from_pretrained(
             self.tokenizer_name,
             cache_dir=self.cache_dir,
+            tokenize_chinese_chars=False,
+            strip_accents=False,
         )
         download_dataset(self.data_dir)
         self.train_examples = read_examples_from_file(self.data_dir, Split.train)
@@ -505,14 +482,14 @@ class TokenClassificationDataModule(pl.LightningDataModule):
     ) -> TokenClassificationDataset:
         return TokenClassificationDataset(
             data,
-            self.label_token_aligner,
             self.tokenizer,
+            self.label_token_aligner,
             self.max_seq_length,
             # pin_memory=True
         )
 
+    @staticmethod
     def create_dataloader(
-        self,
         ds: TokenClassificationDataset,
         batch_size: int,
         num_workers: int = 0,
@@ -528,26 +505,17 @@ class TokenClassificationDataModule(pl.LightningDataModule):
 
     def train_dataloader(self):
         return self.create_dataloader(
-            self.train_dataset,
-            self.train_batch_size,
-            num_workers=self.num_workers,
-            shuffle=True,
+            self.train_dataset, self.train_batch_size, self.num_workers, shuffle=True
         )
 
     def val_dataloader(self):
         return self.create_dataloader(
-            self.dev_dataset,
-            self.eval_batch_size,
-            num_workers=self.num_workers,
-            shuffle=False,
+            self.dev_dataset, self.eval_batch_size, self.num_workers, shuffle=False
         )
 
     def test_dataloader(self):
         return self.create_dataloader(
-            self.test_dataset,
-            self.eval_batch_size,
-            num_workers=self.num_workers,
-            shuffle=False,
+            self.test_dataset, self.eval_batch_size, self.num_workers, shuffle=False
         )
 
     def total_steps(self) -> int:
@@ -627,8 +595,6 @@ class TokenClassificationModule(pl.LightningModule):
         label_token_aligner = LabelTokenAligner(hparams.labels)
         self.label_ids_to_label = label_token_aligner.ids_to_label
         num_labels = len(self.label_ids_to_label)
-        self.scheduler = None
-        self.optimizer = None
 
         super().__init__()
         # Enable to access arguments via self.hparams
@@ -649,6 +615,8 @@ class TokenClassificationModule(pl.LightningModule):
         self.tokenizer = BertTokenizerFast.from_pretrained(
             self.tokenizer_name,
             cache_dir=self.cache_dir,
+            tokenize_chinese_chars=False,
+            strip_accents=False,
         )
 
         # AutoConfig
@@ -665,10 +633,7 @@ class TokenClassificationModule(pl.LightningModule):
             "attention_dropout",
         )
         for p in extra_model_params:
-            if getattr(self.hparams, p, None):
-                assert hasattr(
-                    self.config, p
-                ), f"model config doesn't have a `{p}` attribute"
+            if getattr(self.hparams, p, None) and hasattr(self.config, p):
                 setattr(self.config, p, getattr(self.hparams, p, None))
 
         # AutoModelForTokenClassification
@@ -678,32 +643,32 @@ class TokenClassificationModule(pl.LightningModule):
             config=self.config,
             cache_dir=self.cache_dir,
         )
-        # for param in self.model.parameters():
-        #     param.requires_grad = False
+
+        self.scheduler = None
+        self.optimizer = None
 
     def forward(self, **inputs) -> TokenClassifierOutput:
-        """ BertForTokenClassification.forward(
-            input_ids=None,
-            attention_mask=None,
-            token_type_ids=None,
-            position_ids=None,
-            head_mask=None,
-            inputs_embeds=None,
-            labels=None,
-            output_attentions=None,
-            output_hidden_states=None,
-            return_dict=None,)
+        """BertForTokenClassification.forward(
+        input_ids=None,
+        attention_mask=None,
+        token_type_ids=None,
+        position_ids=None,
+        head_mask=None,
+        inputs_embeds=None,
+        labels=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,)
         """
         return self.model(**inputs)
 
-    def training_step(self, train_batch: InputFeaturesBatch, batch_idx) -> Dict:
+    def training_step(
+        self, train_batch: InputFeaturesBatch, batch_idx
+    ) -> Dict[str, torch.Tensor]:
         # .to(self.device) is not necessary with pl.Traner
         inputs = {
             "input_ids": train_batch.input_ids,
             "attention_mask": train_batch.attention_mask,
-            "token_type_ids": train_batch.token_type_ids
-            if self.config.model_type in ["bert", "xlnet"]
-            else None,
             "labels": train_batch.label_ids,
         }
         output: TokenClassifierOutput = self(**inputs)
@@ -711,52 +676,49 @@ class TokenClassificationModule(pl.LightningModule):
         self.log("train_loss", loss)
         return {"loss": loss}
 
-    def validation_step(self, val_batch: InputFeaturesBatch, batch_idx) -> Dict:
+    def validation_step(
+        self, val_batch: InputFeaturesBatch, batch_idx
+    ) -> Dict[str, torch.Tensor]:
         # .to(self.device) is not necessary with pl.Traner
         inputs = {
             "input_ids": val_batch.input_ids,
             "attention_mask": val_batch.attention_mask,
-            "token_type_ids": val_batch.token_type_ids
-            if self.config.model_type in ["bert", "xlnet"]
-            else None,
             "labels": val_batch.label_ids,
         }
         output: TokenClassifierOutput = self(**inputs)
         loss = output.loss
         # self.log("val_step_loss", loss)
         return {
-            "val_step_loss": loss.detach().cpu(),
+            "val_step_loss": loss,
         }
 
-    def test_step(self, test_batch: InputFeaturesBatch, batch_idx) -> Dict:
+    def test_step(
+        self, test_batch: InputFeaturesBatch, batch_idx
+    ) -> Dict[str, torch.Tensor]:
         # .to(self.device) is not necessary with pl.Traner
         inputs = {
             "input_ids": test_batch.input_ids,
             "attention_mask": test_batch.attention_mask,
-            "token_type_ids": test_batch.token_type_ids
-            if self.config.model_type in ["bert", "xlnet"]
-            else None,
             "labels": test_batch.label_ids,
         }
         output: TokenClassifierOutput = self(**inputs)
-        logits = output.logits
-        preds = logits.detach().cpu().numpy()
-        target_ids = []
-        if inputs["labels"].shape[0] > 0:
-            target_ids = inputs["labels"].detach().cpu().numpy()
         return {
-            "pred": preds,
-            "target": target_ids,
+            "pred": output.logits,
+            "target": inputs["labels"],
         }
 
-    def validation_epoch_end(self, outputs: List[Dict]):
+    def validation_epoch_end(self, outputs: List[Dict[str, torch.Tensor]]):
         avg_loss = torch.stack([x["val_step_loss"] for x in outputs]).mean()
         self.log("val_loss", avg_loss, sync_dist=True)
 
-    def test_epoch_end(self, outputs: List[Dict]):
-        preds = np.concatenate([x["pred"] for x in outputs], axis=0)
+    def test_epoch_end(self, outputs: List[Dict[str, torch.Tensor]]):
+        preds = np.concatenate(
+            [x["pred"].detach().cpu().numpy() for x in outputs], axis=0
+        )
         preds = np.argmax(preds, axis=2)
-        target_ids = np.concatenate([x["target"] for x in outputs], axis=0)
+        target_ids = np.concatenate(
+            [x["target"].detach().cpu().numpy() for x in outputs], axis=0
+        )
 
         target_list: StrListList = [[] for _ in range(target_ids.shape[0])]
         preds_list: StrListList = [[] for _ in range(target_ids.shape[0])]
