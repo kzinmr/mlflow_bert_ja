@@ -51,6 +51,7 @@ IntListList = List[IntList]
 StrList = List[str]
 StrListList = List[StrList]
 
+
 class Split(Enum):
     train = "train"
     dev = "dev"
@@ -87,7 +88,6 @@ class InputFeatures:
 
 
 class InputFeaturesBatch:
-
     def __init__(self, features: List[InputFeatures]):
         self.input_ids: torch.Tensor
         self.attention_masks: torch.Tensor
@@ -118,6 +118,7 @@ class InputFeaturesBatch:
 
     def __getitem__(self, item):
         return getattr(self, item)
+
 
 def download_dataset(data_dir: str):
     def _download_data(url, file_path):
@@ -471,9 +472,9 @@ class TokenClassificationDataModule(pl.LightningDataModule):
         self.dev_examples = read_examples_from_file(self.data_dir, Split.dev)
         self.test_examples = read_examples_from_file(self.data_dir, Split.test)
         if self.num_samples > 0:
-            self.train_examples = self.train_examples[:self.num_samples]
-            self.dev_examples = self.dev_examples[:self.num_samples]
-            self.test_examples = self.test_examples[:self.num_samples]
+            self.train_examples = self.train_examples[: self.num_samples]
+            self.dev_examples = self.dev_examples[: self.num_samples]
+            self.test_examples = self.test_examples[: self.num_samples]
         self.train_data = convert_spandata(self.train_examples)
         self.dev_data = convert_spandata(self.dev_examples)
         self.test_data = convert_spandata(self.test_examples)
@@ -500,7 +501,10 @@ class TokenClassificationDataModule(pl.LightningDataModule):
 
     def get_dataset(self, data: List[StringSpanExample]):
         return NERDataset(
-            data, self.label_token_aligner, self.tokenizer, self.max_seq_length,
+            data,
+            self.label_token_aligner,
+            self.tokenizer,
+            self.max_seq_length,
             # pin_memory=True
         )
 
@@ -511,7 +515,9 @@ class TokenClassificationDataModule(pl.LightningDataModule):
         """
         pass
 
-    def get_dataloader(self, ds: NERDataset, bs: int, num_workers: int=0, shuffle: bool=False) -> DataLoader:
+    def get_dataloader(
+        self, ds: NERDataset, bs: int, num_workers: int = 0, shuffle: bool = False
+    ) -> DataLoader:
         return DataLoader(
             ds,
             collate_fn=InputFeaturesBatch,
@@ -809,9 +815,13 @@ class TokenClassificationModule(pl.LightningModule):
 
         results = {
             "accuracy_score": accuracy_score(target_list, preds_list),
-            "precision": precision_score(target_list, preds_list, mode='strict', scheme=BILOU),
-            "recall": recall_score(target_list, preds_list, mode='strict', scheme=BILOU),
-            "f1": f1_score(target_list, preds_list, mode='strict', scheme=BILOU),
+            "precision": precision_score(
+                target_list, preds_list, mode="strict", scheme=BILOU
+            ),
+            "recall": recall_score(
+                target_list, preds_list, mode="strict", scheme=BILOU
+            ),
+            "f1": f1_score(target_list, preds_list, mode="strict", scheme=BILOU),
         }
 
         self.log("test_accuracy", results["accuracy_score"])
@@ -995,9 +1005,7 @@ def add_common_args(parser):
         default=1,
         help="Number of updates steps to accumulate before performing a backward/update pass.",
     )
-    parser.add_argument(
-        "--num_train_epochs", dest="max_epochs", default=3, type=int
-    )
+    parser.add_argument("--num_train_epochs", dest="max_epochs", default=3, type=int)
     parser.add_argument(
         "--seed", type=int, default=42, help="random seed for initialization"
     )
@@ -1023,6 +1031,7 @@ def add_common_args(parser):
     )
     return parser
 
+
 def make_trainer(parser):
     """
     Prepare pl.Trainer with callbacks and args
@@ -1034,7 +1043,7 @@ def make_trainer(parser):
 
     checkpoint_callback = ModelCheckpoint(
         dirpath=argparse_args.output_dir,
-        filename='checkpoint-{epoch}-{val_loss:.2f}',
+        filename="checkpoint-{epoch}-{val_loss:.2f}",
         save_top_k=1,
         verbose=True,
         monitor="val_loss",
@@ -1107,4 +1116,3 @@ if __name__ == "__main__":
         # best_model_path = checkpoint_callback.best_model_path
         # trainer.test(ckpt_path=best_model_path)
         # model = model.load_from_checkpoint(best_model_path)
-        
