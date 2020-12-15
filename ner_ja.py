@@ -908,6 +908,38 @@ if __name__ == "__main__":
 
     parser = ArgumentParser(description="Transformers Token Classifier")
 
+    parser.add_argument(
+        "--model_name_or_path",
+        default=None,
+        type=str,
+        required=True,
+        help="Path to pretrained model or model identifier from huggingface.co/models",
+    )
+    parser.add_argument(
+        "--output_dir",
+        default=None,
+        type=str,
+        required=True,
+        help="The output directory where the model predictions and checkpoints will be written.",
+    )
+    parser.add_argument(
+        "--cache_dir",
+        default="",
+        type=str,
+        help="Where do you want to store the pre-trained models downloaded from huggingface.co",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42, help="random seed for initialization"
+    )
+    parser.add_argument(
+        "--do_train", action="store_true", help="Whether to run training."
+    )
+    parser.add_argument(
+        "--do_predict",
+        action="store_true",
+        help="Whether to run predictions on the test set.",
+    )
+
     parser = pl.Trainer.add_argparse_args(parent_parser=parser)
     parser = TokenClassificationModule.add_model_specific_args(parent_parser=parser)
     parser = TokenClassificationDataModule.add_model_specific_args(parent_parser=parser)
