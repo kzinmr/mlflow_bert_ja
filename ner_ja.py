@@ -1,6 +1,5 @@
 import logging
 import os
-import random
 from argparse import ArgumentParser, Namespace
 from dataclasses import dataclass
 from enum import Enum
@@ -485,7 +484,6 @@ class TokenClassificationDataModule(pl.LightningDataModule):
             self.tokenizer,
             self.label_token_aligner,
             self.max_seq_length,
-            # pin_memory=True
         )
 
     @staticmethod
@@ -500,6 +498,7 @@ class TokenClassificationDataModule(pl.LightningDataModule):
             collate_fn=InputFeaturesBatch,
             batch_size=batch_size,
             num_workers=num_workers,
+            pin_memory=True,
             shuffle=shuffle,
         )
 
@@ -662,54 +661,42 @@ class TokenClassificationModule(pl.LightningModule):
         """
         return self.model(**inputs)
 
+    def shared_step(self, batch: InputFeaturesBatch) -> TokenClassifierOutput:
+        # .to(self.device) is not necessary with pl.Traner
+        inputs = {
+            "input_ids": batch.input_ids,
+            "attention_mask": batch.attention_mask,
+            "labels": batch.label_ids,
+        }
+        return self.model(**inputs)
+
     def training_step(
         self, train_batch: InputFeaturesBatch, batch_idx
     ) -> Dict[str, torch.Tensor]:
-        # .to(self.device) is not necessary with pl.Traner
-        inputs = {
-            "input_ids": train_batch.input_ids,
-            "attention_mask": train_batch.attention_mask,
-            "labels": train_batch.label_ids,
-        }
-        output: TokenClassifierOutput = self(**inputs)
+        output = self.shared_step(train_batch)
         loss = output.loss
-        self.log("train_loss", loss)
+        self.log(
+            "train_loss", loss, prog_bar=True
+        )
         return {"loss": loss}
 
     def validation_step(
         self, val_batch: InputFeaturesBatch, batch_idx
     ) -> Dict[str, torch.Tensor]:
-        # .to(self.device) is not necessary with pl.Traner
-        inputs = {
-            "input_ids": val_batch.input_ids,
-            "attention_mask": val_batch.attention_mask,
-            "labels": val_batch.label_ids,
-        }
-        output: TokenClassifierOutput = self(**inputs)
-        loss = output.loss
-        # self.log("val_step_loss", loss)
+        output = self.shared_step(val_batch)
         return {
-            "val_step_loss": loss,
-        }
-
-    def test_step(
-        self, test_batch: InputFeaturesBatch, batch_idx
-    ) -> Dict[str, torch.Tensor]:
-        # .to(self.device) is not necessary with pl.Traner
-        inputs = {
-            "input_ids": test_batch.input_ids,
-            "attention_mask": test_batch.attention_mask,
-            "labels": test_batch.label_ids,
-        }
-        output: TokenClassifierOutput = self(**inputs)
-        return {
-            "pred": output.logits,
-            "target": inputs["labels"],
+            "val_step_loss": output.loss,
         }
 
     def validation_epoch_end(self, outputs: List[Dict[str, torch.Tensor]]):
         avg_loss = torch.stack([x["val_step_loss"] for x in outputs]).mean()
         self.log("val_loss", avg_loss, sync_dist=True)
+
+    def test_step(
+        self, test_batch: InputFeaturesBatch, batch_idx
+    ) -> Dict[str, torch.Tensor]:
+        output = self.shared_step(test_batch)
+        return {"pred": output.logits, "target": test_batch.label_ids}
 
     def test_epoch_end(self, outputs: List[Dict[str, torch.Tensor]]):
         preds = np.concatenate(
@@ -891,7 +878,7 @@ def make_trainer(argparse_args: Namespace):
     lr_logger = LearningRateMonitor()
     logging_callback = LoggingCallback()
 
-    train_params = {}
+    train_params = {"deterministic": True}
     if args.gpus > 1:
         train_params["distributed_backend"] = "ddp"
     train_params["accumulate_grad_batches"] = args.accumulate_grad_batches
@@ -926,21 +913,20 @@ if __name__ == "__main__":
     parser = TokenClassificationDataModule.add_model_specific_args(parent_parser=parser)
     args = parser.parse_args()
 
-    # init
+    # sets seeds for numpy, torch, python.random and PYTHONHASHSEED.
     pl.seed_everything(args.seed)
-    random.seed(args.seed)
-    os.environ["PYTHONHASHSEED"] = str(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
 
     Path(args.output_dir).mkdir(exist_ok=True)
 
-    mlflow.pytorch.autolog()
+
+    # Logs loss and any other metrics specified in the fit function,
+    # and optimizer data as parameters. Model checkpoints are logged
+    # as artifacts and pytorch model is stored under `model` directory.
+    mlflow.pytorch.autolog(log_every_n_epoch=1, log_models=True)
 
     model, dm = make_model_and_dm(args)
     trainer, checkpoint_callback = make_trainer(args)
 
-    # MLflow Autologging is performed here
     trainer.fit(model, dm)
 
     if args.do_predict:
@@ -948,3 +934,7 @@ if __name__ == "__main__":
         trainer.test()
         # best_model_path = checkpoint_callback.best_model_path
         # model = model.load_from_checkpoint(best_model_path)
+
+    # scripted_pytorch_model = torch.jit.save(model.to_torchscript(), "model.pt")
+    # with mlflow.start_run() as run:
+    #     mlflow.pytorch.save_model(model, pytorch_model_path)
