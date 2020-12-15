@@ -954,7 +954,7 @@ if __name__ == "__main__":
     # Logs loss and any other metrics specified in the fit function,
     # and optimizer data as parameters. Model checkpoints are logged
     # as artifacts and pytorch model is stored under `model` directory.
-    mlflow.pytorch.autolog(log_every_n_epoch=1, log_models=True)
+    mlflow.pytorch.autolog(log_every_n_epoch=1)
 
     model, dm = make_model_and_dm(args)
     trainer, checkpoint_callback = make_trainer(args)
