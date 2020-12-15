@@ -662,11 +662,11 @@ class TokenClassificationModule(pl.LightningModule):
         return self.model(**inputs)
 
     def shared_step(self, batch: InputFeaturesBatch) -> TokenClassifierOutput:
-        # .to(self.device) is not necessary with pl.Traner
+        # .to(self.device) is not necessary with pl.Traner ??
         inputs = {
-            "input_ids": batch.input_ids,
-            "attention_mask": batch.attention_mask,
-            "labels": batch.label_ids,
+            "input_ids": batch.input_ids.to(self.device),
+            "attention_mask": batch.attention_mask.to(self.device),
+            "labels": batch.label_ids.to(self.device),
         }
         return self.model(**inputs)
 
