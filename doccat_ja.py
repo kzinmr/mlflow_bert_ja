@@ -121,13 +121,13 @@ class SequenceClassificationDataset(Dataset):
 
     def __init__(
         self,
-        data: List[SequenceClassificationExample],
+        examples: List[SequenceClassificationExample],
         tokenizer: PreTrainedTokenizerFast,
         label_to_id: Dict[str, int],
         tokens_per_batch: int = 32,
     ):
         self.features: List[InputFeatures] = []
-        self.examples: List[SequenceClassificationExample] = data
+        self.examples: List[SequenceClassificationExample] = examples
         texts: StrList = [ex.text for ex in self.examples]
         labels: StrList = [ex.label for ex in self.examples]
 

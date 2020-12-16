@@ -261,6 +261,14 @@ class LabelTokenAligner:
             self.ids_to_label[i] = l
 
     @staticmethod
+    def get_ids_to_label(labels_path: str) -> Dict[int, str]:
+        with open(labels_path, "r") as f:
+            labels = [l for l in f.read().splitlines() if l and l != "O"]
+        ids_to_label = {i: f"{s}-{label}" for i, (label, s) in enumerate(product(labels, "BILU"), 1)}
+        ids_to_label[0] = "O"
+        return ids_to_label
+
+    @staticmethod
     def align_tokens_and_annotations_bilou(
         tokenized: Encoding, annotations: List[SpanAnnotation]
     ) -> StrList:
@@ -310,15 +318,27 @@ class TokenClassificationDataset(Dataset):
 
     def __init__(
         self,
-        data: List[StringSpanExample],
+        examples: List[StringSpanExample],
         tokenizer: PreTrainedTokenizerFast,
         label_token_aligner: LabelTokenAligner,
         tokens_per_batch: int = 32,
+        window_stride: Optional[int] = None,
     ):
+        """ tokenize_and_align_labels with long text (i.e. truncation is disabled)
+        """
         self.features: List[InputFeatures] = []
         self.examples: List[TokenClassificationExample] = []
-        texts: StrList = [ex.content for ex in data]
+        texts: StrList = [ex.content for ex in examples]
         annotations: List[List[SpanAnnotation]] = [ex.annotations for ex in data]
+
+        if window_stride is None:
+            self.window_stride = tokens_per_batch
+        elif window_stride > tokens_per_batch:
+            logger.error("window_stride must be smaller than tokens_per_batch(max_seq_length)")
+        else:
+            logger.warning("""window_stride != tokens_per_batch:
+            The input data windows are overlapping. Merge the overlapping labels after processing InputFeatures.
+            """)
 
         # tokenize text into subwords
         # NOTE: add_special_tokens
@@ -334,10 +354,10 @@ class TokenClassificationDataset(Dataset):
         )
 
         # perform manual padding and register features
-        guids: StrList = [ex.guid for ex in data]
+        guids: StrList = [ex.guid for ex in examples]
         for guid, encoding, label_ids in zip(guids, encodings, aligned_label_ids):
             seq_length = len(label_ids)
-            for start in range(0, seq_length, tokens_per_batch):
+            for start in range(0, seq_length, self.window_stride):
                 end = min(start + tokens_per_batch, seq_length)
                 n_padding_to_add = max(0, tokens_per_batch - end + start)
                 self.features.append(
@@ -589,8 +609,7 @@ class TokenClassificationModule(pl.LightningModule):
         if isinstance(hparams, Dict):
             hparams = Namespace(**hparams)
 
-        label_token_aligner = LabelTokenAligner(hparams.labels)
-        self.label_ids_to_label = label_token_aligner.ids_to_label
+        self.label_ids_to_label = LabelTokenAligner.get_ids_to_label(hparams.labels)
         num_labels = len(self.label_ids_to_label)
 
         super().__init__()
