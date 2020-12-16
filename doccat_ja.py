@@ -14,7 +14,7 @@ import torch
 from pytorch_lightning.callbacks import (
     EarlyStopping,
     LearningRateMonitor,
-    ModelCheckpoint
+    ModelCheckpoint,
 )
 from pytorch_lightning.utilities import rank_zero_info
 from sklearn.metrics import accuracy_score
@@ -22,14 +22,14 @@ from sklearn.model_selection import train_test_split
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Dataset
 from transformers import (
-    Adafactor,
     AdamW,
+    BatchEncoding,
     BertConfig,
     BertForSequenceClassification,
     BertTokenizerFast,
     PretrainedConfig,
     PreTrainedModel,
-    PreTrainedTokenizerFast
+    PreTrainedTokenizerFast,
 )
 from transformers.modeling_outputs import SequenceClassifierOutput
 from transformers.optimization import Adafactor
@@ -38,7 +38,7 @@ from transformers.optimization import Adafactor
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 IntList = List[int]
-IntListList = List[List[int]]
+IntListList = List[IntList]
 StrList = List[str]
 TEXT_COL_NAME: str = "text"
 LABEL_COL_NAME: str = "label"
@@ -66,14 +66,14 @@ class Split(Enum):
 class InputExample:
     guid: str
     text: str
-    label: Optional[str]
+    label: str
 
 
 @dataclass
 class InputFeatures:
     input_ids: IntList
     attention_mask: IntList
-    label_ids: Optional[IntList]
+    label_ids: IntList
 
 
 def download_and_extract_corpus(data_dir: Path) -> Optional[Path]:
@@ -129,9 +129,10 @@ class SequenceClassificationDataset(Dataset):
         self.features: List[InputFeatures] = []
         self.examples: List[InputExample] = data
         texts: StrList = [ex.text for ex in self.examples]
-        labels: StrList = [ex.label for ex in self.examples if ex.label]
+        labels: StrList = [ex.label for ex in self.examples]
 
-        self.encodings = [
+        # tokenize text into subwords with padding and truncation
+        self.encodings: List[BatchEncoding] = [
             tokenizer.encode_plus(
                 text,
                 add_special_tokens=True,
@@ -144,24 +145,16 @@ class SequenceClassificationDataset(Dataset):
             )
             for text in texts
         ]
-        if labels:
-            self.features = [
-                InputFeatures(
-                    input_ids=encoding.input_ids.flatten().tolist(),
-                    attention_mask=encoding.attention_mask.flatten().tolist(),
-                    label_ids=[label_to_id.get(label, 0)],
-                )
-                for encoding, label in zip(self.encodings, labels)
-            ]
-        else:
-            self.features = [
-                InputFeatures(
-                    input_ids=encoding.input_ids.flatten().tolist(),
-                    attention_mask=encoding.attention_mask.flatten().tolist(),
-                    label_ids=None,
-                )
-                for encoding in self.encodings
-            ]
+
+        # register features
+        self.features = [
+            InputFeatures(
+                input_ids=encoding.input_ids.flatten().tolist(),
+                attention_mask=encoding.attention_mask.flatten().tolist(),
+                label_ids=[label_to_id.get(label, 0)],
+            )
+            for encoding, label in zip(self.encodings, labels)
+        ]
         self._n_features = len(self.features)
 
     def __len__(self):
@@ -177,22 +170,22 @@ class InputFeaturesBatch:
         self.attention_masks: torch.Tensor
         self.label_ids: Optional[torch.Tensor]
 
-        self.n_features = len(features)
+        self._n_features = len(features)
         input_ids_list: IntListList = []
         masks_list: IntListList = []
-        label_ids: IntListList = []
+        label_ids_list: IntListList = []
         for f in features:
             input_ids_list.append(f.input_ids)
             masks_list.append(f.attention_mask)
             if f.label_ids is not None:
-                label_ids.append(f.label_ids)
+                label_ids_list.append(f.label_ids)
         self.input_ids = torch.LongTensor(input_ids_list)
         self.attention_mask = torch.LongTensor(masks_list)
-        if label_ids:
-            self.label_ids = torch.LongTensor(label_ids)
+        if label_ids_list:
+            self.label_ids = torch.LongTensor(label_ids_list)
 
     def __len__(self):
-        return self.n_features
+        return self._n_features
 
     def __getitem__(self, item):
         return getattr(self, item)
@@ -206,10 +199,10 @@ class SequenceClassificationDataModule(pl.LightningDataModule):
     def __init__(self, hparams: Namespace):
         self.tokenizer: PreTrainedTokenizerFast
         self.train_examples: List[InputExample]
-        self.dev_examples: List[InputExample]
+        self.val_examples: List[InputExample]
         self.test_examples: List[InputExample]
         self.train_dataset: SequenceClassificationDataset
-        self.dev_dataset: SequenceClassificationDataset
+        self.val_dataset: SequenceClassificationDataset
         self.test_dataset: SequenceClassificationDataset
         self.df_org: pd.DataFrame
         self.df_use: pd.DataFrame
@@ -241,14 +234,8 @@ class SequenceClassificationDataModule(pl.LightningDataModule):
         )
         df = make_livedoor_corpus_dataset(self.data_dir)
         self.df_org = df
-
-        # df.sample(frac=1)
         if self.num_samples > 0:
             df = df.iloc[: self.num_samples]
-        # label_to_id =  {k: v for v, k in enumerate(LABELS)}
-        self.label_to_id = {
-            k: v for v, k in enumerate(sorted(set(df[LABEL_COL_NAME].values.tolist())))
-        }
         self.df_use = df
 
     def setup(self, stage=None):
@@ -258,8 +245,11 @@ class SequenceClassificationDataModule(pl.LightningDataModule):
         """
 
         df = self.df_use
+        # label_to_id =  {k: v for v, k in enumerate(LABELS)}
+        self.label_to_id = {
+            k: v for v, k in enumerate(sorted(set(df[LABEL_COL_NAME].values.tolist())))
+        }
 
-        # NOTE: (fixed) np.random random_state is used by default
         df_train, df_test = train_test_split(
             df, test_size=0.3, stratify=df[LABEL_COL_NAME]
         )
@@ -447,26 +437,15 @@ class SequenceClassificationModule(pl.LightningModule):
         self.optimizer = None
 
     def forward(self, **inputs) -> SequenceClassifierOutput:
-        """BertForSequenceClassification.forward(
-        input_ids=None,
-        attention_mask=None,
-        token_type_ids=None,
-        position_ids=None,
-        head_mask=None,
-        inputs_embeds=None,
-        labels=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,)
-        """
+        """BertForSequenceClassification.forward"""
         return self.model(**inputs)
 
     def shared_step(self, batch: InputFeaturesBatch) -> SequenceClassifierOutput:
-        # .to(self.device) is not necessary with pl.Traner
+        # .to(self.device) is not necessary with pl.Traner ??
         inputs = {
-            "input_ids": batch.input_ids,
-            "attention_mask": batch.attention_mask,
-            "labels": batch.label_ids,
+            "input_ids": batch.input_ids.to(self.device),
+            "attention_mask": batch.attention_mask.to(self.device),
+            "labels": batch.label_ids.to(self.device),
         }
         return self.model(**inputs)
 
@@ -475,9 +454,7 @@ class SequenceClassificationModule(pl.LightningModule):
     ) -> Dict[str, torch.Tensor]:
         output = self.shared_step(train_batch)
         loss = output.loss
-        self.log(
-            "train_loss", loss, prog_bar=True
-        )
+        self.log("train_loss", loss, prog_bar=True)
         return {"loss": loss}
 
     def validation_step(
@@ -651,7 +628,7 @@ def make_trainer(argparse_args: Namespace):
     lr_logger = LearningRateMonitor()
     logging_callback = LoggingCallback()
 
-    train_params = {}
+    train_params = {"deterministic": True}
     if args.gpus > 1:
         train_params["distributed_backend"] = "ddp"
     train_params["accumulate_grad_batches"] = args.accumulate_grad_batches
@@ -662,19 +639,6 @@ def make_trainer(argparse_args: Namespace):
         **train_params,
     )
     return trainer, checkpoint_callback
-
-
-def make_model_and_dm(argparse_args: Namespace):
-    """
-    Prepare pl.LightningDataModule and pl.LightningModule
-    """
-    dm = SequenceClassificationDataModule(argparse_args)
-    dm.prepare_data()
-    dm.setup(stage="fit")
-
-    model = SequenceClassificationModule(argparse_args)
-
-    return model, dm
 
 
 if __name__ == "__main__":
@@ -728,12 +692,16 @@ if __name__ == "__main__":
     # Logs loss and any other metrics specified in the fit function,
     # and optimizer data as parameters. Model checkpoints are logged
     # as artifacts and pytorch model is stored under `model` directory.
-    mlflow.pytorch.autolog(log_every_n_epoch=1, log_models=True)
+    mlflow.pytorch.autolog(log_every_n_epoch=1)
 
-    model, dm = make_model_and_dm(args)
+    dm = SequenceClassificationDataModule(args)
+    dm.prepare_data()
+    dm.setup(stage="fit")
+
+    model = SequenceClassificationModule(args)
+
     trainer, checkpoint_callback = make_trainer(args)
 
-    # MLflow Autologging is performed here
     trainer.fit(model, dm)
 
     if args.do_predict:

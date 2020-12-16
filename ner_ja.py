@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from enum import Enum
 from itertools import product, starmap
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Union
 
 import mlflow.pytorch
 import numpy as np
@@ -15,20 +15,20 @@ import torch
 from pytorch_lightning.callbacks import (
     EarlyStopping,
     LearningRateMonitor,
-    ModelCheckpoint
+    ModelCheckpoint,
 )
 from pytorch_lightning.utilities import rank_zero_info
 from seqeval.metrics import (
     accuracy_score,
     f1_score,
     precision_score,
-    recall_score
+    recall_score,
 )
 from seqeval.scheme import BILOU
 from tokenizers import Encoding
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Dataset
-from transformers import (  # AutoConfig,; AutoModelForTokenClassification,; AutoTokenizer,
+from transformers import (
     AdamW,
     BatchEncoding,
     BertConfig,
@@ -36,7 +36,7 @@ from transformers import (  # AutoConfig,; AutoModelForTokenClassification,; Aut
     BertTokenizerFast,
     PretrainedConfig,
     PreTrainedModel,
-    PreTrainedTokenizerFast
+    PreTrainedTokenizerFast,
 )
 from transformers.modeling_outputs import TokenClassifierOutput
 from transformers.optimization import Adafactor
@@ -45,11 +45,12 @@ from transformers.optimization import Adafactor
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 logger = logging.getLogger(__name__)
-PAD_TOKEN_LABEL_ID = -100
+
 IntList = List[int]
 IntListList = List[IntList]
 StrList = List[str]
 StrListList = List[StrList]
+PAD_TOKEN_LABEL_ID = -100
 
 
 class Split(Enum):
@@ -75,15 +76,15 @@ class StringSpanExample:
 @dataclass
 class TokenLabelExample:
     guid: str
-    words: List[str]
-    labels: Optional[List[str]]
+    words: StrList
+    labels: StrList
 
 
 @dataclass
 class InputFeatures:
     input_ids: IntList
     attention_mask: IntList
-    label_ids: Optional[IntList] = None
+    label_ids: IntList
 
 
 def download_dataset(data_dir: str):
@@ -217,25 +218,23 @@ def convert_spandata(examples: List[TokenLabelExample]) -> List[StringSpanExampl
         text = "".join(words)
         labels = example.labels
         annotations: List[SpanAnnotation] = []
-        if labels:
-            word_spans = _get_original_spans(words, text)
-            label_span = []
-            labeltype = ""
-            for span, label in zip(word_spans, labels):
-                if label == "O" and label_span and labeltype:
-                    start, end = label_span[0][0], label_span[-1][-1]
-                    annotations.append(
-                        SpanAnnotation(start=start, end=end, label=labeltype)
-                    )
-                    label_span = []
-                elif label != "O":
-                    labeltype = label[2:]
-                    label_span.append(span)
-            if label_span and labeltype:
+
+        word_spans = _get_original_spans(words, text)
+        label_span = []
+        labeltype = ""
+        for span, label in zip(word_spans, labels):
+            if label == "O" and label_span and labeltype:
                 start, end = label_span[0][0], label_span[-1][-1]
                 annotations.append(
                     SpanAnnotation(start=start, end=end, label=labeltype)
                 )
+                label_span = []
+            elif label != "O":
+                labeltype = label[2:]
+                label_span.append(span)
+        if label_span and labeltype:
+            start, end = label_span[0][0], label_span[-1][-1]
+            annotations.append(SpanAnnotation(start=start, end=end, label=labeltype))
 
         new_examples.append(
             StringSpanExample(guid=example.guid, content=text, annotations=annotations)
@@ -245,7 +244,7 @@ def convert_spandata(examples: List[TokenLabelExample]) -> List[StringSpanExampl
 
 class LabelTokenAligner:
     """
-    Align token-wise BIOLU-labels with subtokens
+    Align word-wise BIOLU-labels with subword tokens
     """
 
     def __init__(self, labels_path: str):
@@ -263,7 +262,7 @@ class LabelTokenAligner:
     def align_tokens_and_annotations_bilou(
         tokenized: Encoding, annotations: List[SpanAnnotation]
     ) -> StrList:
-        """Make subtoken-wise BIOLU-labels aligned with given subtokens
+        """Make word-wise BIOLU-labels aligned with given subwords
         :param tokenized: output of PreTrainedTokenizerFast
         :param annotations: annotations of string span format
         """
@@ -271,7 +270,7 @@ class LabelTokenAligner:
             tokenized.tokens
         )  # Make a list to store our labels the same length as our tokens
         for anno in annotations:
-            annotation_token_ix_set: Set[int] = set()
+            annotation_token_ix_set = set()
             for char_ix in range(anno.start, anno.end):
                 token_ix = tokenized.char_to_token(char_ix)
                 if token_ix is not None:
@@ -316,14 +315,14 @@ class TokenClassificationDataset(Dataset):
     ):
         self.features: List[InputFeatures] = []
         self.examples: List[TokenLabelExample] = []
-        guids: StrList = [ex.guid for ex in data]
         texts: StrList = [ex.content for ex in data]
         annotations: List[List[SpanAnnotation]] = [ex.annotations for ex in data]
 
         # tokenize text into subwords
-        # NOTE: add_special_tokens=True is unnecessary for NER (ok?)
+        # NOTE: add_special_tokens
         tokenized_batch: BatchEncoding = tokenizer(texts, add_special_tokens=False)
         encodings: List[Encoding] = tokenized_batch.encodings
+
         # align word-wise labels with subwords
         aligned_label_ids: IntListList = list(
             starmap(
@@ -331,7 +330,9 @@ class TokenClassificationDataset(Dataset):
                 zip(encodings, annotations),
             )
         )
+
         # perform manual padding and register features
+        guids: StrList = [ex.guid for ex in data]
         for guid, encoding, label_ids in zip(guids, encodings, aligned_label_ids):
             seq_length = len(label_ids)
             for start in range(0, seq_length, tokens_per_batch):
@@ -357,9 +358,10 @@ class TokenClassificationDataset(Dataset):
                 self.examples.append(
                     TokenLabelExample(guid=guid, words=subwords, labels=labels)
                 )
+        self._n_features = len(self.features)
 
     def __len__(self):
-        return len(self.features)
+        return self._n_features
 
     def __getitem__(self, idx) -> InputFeatures:
         return self.features[idx]
@@ -371,22 +373,22 @@ class InputFeaturesBatch:
         self.attention_masks: torch.Tensor
         self.label_ids: Optional[torch.Tensor]
 
-        self.n_features = len(features)
-        input_ids: IntListList = []
-        masks: IntListList = []
-        label_ids: IntListList = []
+        self._n_features = len(features)
+        input_ids_list: IntListList = []
+        masks_list: IntListList = []
+        label_ids_list: IntListList = []
         for f in features:
-            input_ids.append(f.input_ids)
-            masks.append(f.attention_mask)
+            input_ids_list.append(f.input_ids)
+            masks_list.append(f.attention_mask)
             if f.label_ids is not None:
-                label_ids.append(f.label_ids)
-        self.input_ids = torch.LongTensor(input_ids)
-        self.attention_mask = torch.LongTensor(masks)
-        if label_ids:
-            self.label_ids = torch.LongTensor(label_ids)
+                label_ids_list.append(f.label_ids)
+        self.input_ids = torch.LongTensor(input_ids_list)
+        self.attention_mask = torch.LongTensor(masks_list)
+        if label_ids_list:
+            self.label_ids = torch.LongTensor(label_ids_list)
 
     def __len__(self):
-        return self.n_features
+        return self._n_features
 
     def __getitem__(self, item):
         return getattr(self, item)
@@ -400,13 +402,13 @@ class TokenClassificationDataModule(pl.LightningDataModule):
     def __init__(self, hparams: Namespace):
         self.tokenizer: PreTrainedTokenizerFast
         self.train_examples: List[TokenLabelExample]
-        self.dev_examples: List[TokenLabelExample]
+        self.val_examples: List[TokenLabelExample]
         self.test_examples: List[TokenLabelExample]
         self.train_data: List[StringSpanExample]
-        self.dev_data: List[StringSpanExample]
+        self.val_data: List[StringSpanExample]
         self.test_data: List[StringSpanExample]
         self.train_dataset: TokenClassificationDataset
-        self.dev_dataset: TokenClassificationDataset
+        self.val_dataset: TokenClassificationDataset
         self.test_dataset: TokenClassificationDataset
 
         super().__init__()
@@ -428,8 +430,6 @@ class TokenClassificationDataModule(pl.LightningDataModule):
         """
         Downloads the data and prepare the tokenizer
         """
-        # trf>=4.0.0: PreTrainedTokenizerFast by default
-        # NOTE: AutoTokenizer doesn't load PreTrainedTokenizerFast...
         self.tokenizer = BertTokenizerFast.from_pretrained(
             self.tokenizer_name,
             cache_dir=self.cache_dir,
@@ -438,43 +438,39 @@ class TokenClassificationDataModule(pl.LightningDataModule):
         )
         download_dataset(self.data_dir)
         self.train_examples = read_examples_from_file(self.data_dir, Split.train)
-        self.dev_examples = read_examples_from_file(self.data_dir, Split.dev)
+        self.val_examples = read_examples_from_file(self.data_dir, Split.dev)
         self.test_examples = read_examples_from_file(self.data_dir, Split.test)
         if self.num_samples > 0:
             self.train_examples = self.train_examples[: self.num_samples]
-            self.dev_examples = self.dev_examples[: self.num_samples]
+            self.val_examples = self.val_examples[: self.num_samples]
             self.test_examples = self.test_examples[: self.num_samples]
-        self.train_data = convert_spandata(self.train_examples)
-        self.dev_data = convert_spandata(self.dev_examples)
-        self.test_data = convert_spandata(self.test_examples)
+        self.train_spandata = convert_spandata(self.train_examples)
+        self.val_spandata = convert_spandata(self.val_examples)
+        self.test_spandata = convert_spandata(self.test_examples)
 
         if not os.path.exists(self.labels_path):
-            all_labels = set()
-            for ex in self.train_examples:
-                for l in ex.labels:
-                    all_labels.add(l)
-            for ex in self.dev_examples:
-                for l in ex.labels:
-                    all_labels.add(l)
-            for ex in self.test_examples:
-                for l in ex.labels:
-                    all_labels.add(l)
+            all_labels = {
+                l
+                for ex in self.train_examples + self.val_examples + self.test_examples
+                for l in ex.labels
+            }
             label_types = sorted({l[2:] for l in sorted(all_labels) if l != "O"})
             with open(self.labels_path, "w") as fp:
                 fp.write("\n".join(label_types))
         self.label_token_aligner = LabelTokenAligner(self.labels_path)
 
-        self.train_dataset = self.create_dataset(self.train_data)
-        self.dev_dataset = self.create_dataset(self.dev_data)
-        self.test_dataset = self.create_dataset(self.test_data)
+        self.train_dataset = self.create_dataset(self.train_spandata)
+        self.val_dataset = self.create_dataset(self.val_spandata)
+        self.test_dataset = self.create_dataset(self.test_spandata)
 
         self.dataset_size = len(self.train_dataset)
 
     def setup(self, stage=None):
         """
         split the data into train, test, validation data
-        but here we assume the dataset is splitted in prior
+        :param stage: Stage - training or testing
         """
+        # our dataset is splitted in prior
 
     def create_dataset(
         self, data: List[StringSpanExample]
@@ -509,7 +505,7 @@ class TokenClassificationDataModule(pl.LightningDataModule):
 
     def val_dataloader(self):
         return self.create_dataloader(
-            self.dev_dataset, self.eval_batch_size, self.num_workers, shuffle=False
+            self.val_dataset, self.eval_batch_size, self.num_workers, shuffle=False
         )
 
     def test_dataloader(self):
@@ -574,7 +570,7 @@ class TokenClassificationDataModule(pl.LightningDataModule):
         parser.add_argument(
             "--num_samples",
             type=int,
-            default=0,
+            default=15000,
             metavar="N",
             help="Number of samples to be used for training and evaluation steps (default: 15000) Maximum:100000",
         )
@@ -647,18 +643,7 @@ class TokenClassificationModule(pl.LightningModule):
         self.optimizer = None
 
     def forward(self, **inputs) -> TokenClassifierOutput:
-        """BertForTokenClassification.forward(
-        input_ids=None,
-        attention_mask=None,
-        token_type_ids=None,
-        position_ids=None,
-        head_mask=None,
-        inputs_embeds=None,
-        labels=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,)
-        """
+        """BertForTokenClassification.forward"""
         return self.model(**inputs)
 
     def shared_step(self, batch: InputFeaturesBatch) -> TokenClassifierOutput:
@@ -675,9 +660,7 @@ class TokenClassificationModule(pl.LightningModule):
     ) -> Dict[str, torch.Tensor]:
         output = self.shared_step(train_batch)
         loss = output.loss
-        self.log(
-            "train_loss", loss, prog_bar=True
-        )
+        self.log("train_loss", loss, prog_bar=True)
         return {"loss": loss}
 
     def validation_step(
@@ -715,21 +698,16 @@ class TokenClassificationModule(pl.LightningModule):
                     target_list[i].append(self.label_ids_to_label[target_ids[i][j]])
                     preds_list[i].append(self.label_ids_to_label[preds[i][j]])
 
-        results = {
-            "accuracy_score": accuracy_score(target_list, preds_list),
-            "precision": precision_score(
-                target_list, preds_list, mode="strict", scheme=BILOU
-            ),
-            "recall": recall_score(
-                target_list, preds_list, mode="strict", scheme=BILOU
-            ),
-            "f1": f1_score(target_list, preds_list, mode="strict", scheme=BILOU),
-        }
-
-        self.log("test_accuracy", results["accuracy_score"])
-        self.log("test_precision", results["precision"])
-        self.log("test_recall", results["recall"])
-        self.log("test_f1", results["f1"])
+        accuracy = accuracy_score(target_list, preds_list)
+        precision = precision_score(
+            target_list, preds_list, mode="strict", scheme=BILOU
+        )
+        recall = recall_score(target_list, preds_list, mode="strict", scheme=BILOU)
+        f1 = f1_score(target_list, preds_list, mode="strict", scheme=BILOU)
+        self.log("test_accuracy", accuracy)
+        self.log("test_precision", precision)
+        self.log("test_recall", recall)
+        self.log("test_f1", f1)
 
     def configure_optimizers(self):
         """Prepare optimizer and schedule (linear warmup and decay)"""
@@ -891,19 +869,6 @@ def make_trainer(argparse_args: Namespace):
     return trainer, checkpoint_callback
 
 
-def make_model_and_dm(argparse_args: Namespace):
-    """
-    Prepare pl.LightningDataModule and pl.LightningModule
-    """
-    dm = TokenClassificationDataModule(argparse_args)
-    dm.prepare_data()
-    dm.setup(stage="fit")
-    # DataModule must be loaded first, because label_types.txt is automatically generated
-    model = TokenClassificationModule(argparse_args)
-
-    return model, dm
-
-
 if __name__ == "__main__":
 
     parser = ArgumentParser(description="Transformers Token Classifier")
@@ -950,13 +915,17 @@ if __name__ == "__main__":
 
     Path(args.output_dir).mkdir(exist_ok=True)
 
-
     # Logs loss and any other metrics specified in the fit function,
     # and optimizer data as parameters. Model checkpoints are logged
     # as artifacts and pytorch model is stored under `model` directory.
     mlflow.pytorch.autolog(log_every_n_epoch=1)
 
-    model, dm = make_model_and_dm(args)
+    dm = TokenClassificationDataModule(args)
+    dm.prepare_data()
+    dm.setup(stage="fit")
+    # DataModule must be loaded first, because args.labels is automatically generated
+    model = TokenClassificationModule(args)
+
     trainer, checkpoint_callback = make_trainer(args)
 
     trainer.fit(model, dm)
@@ -964,9 +933,3 @@ if __name__ == "__main__":
     if args.do_predict:
         # NOTE: load the best checkpoint automatically
         trainer.test()
-        # best_model_path = checkpoint_callback.best_model_path
-        # model = model.load_from_checkpoint(best_model_path)
-
-    # scripted_pytorch_model = torch.jit.save(model.to_torchscript(), "model.pt")
-    # with mlflow.start_run() as run:
-    #     mlflow.pytorch.save_model(model, pytorch_model_path)
