@@ -264,7 +264,9 @@ class LabelTokenAligner:
     def get_ids_to_label(labels_path: str) -> Dict[int, str]:
         with open(labels_path, "r") as f:
             labels = [l for l in f.read().splitlines() if l and l != "O"]
-        ids_to_label = {i: f"{s}-{label}" for i, (label, s) in enumerate(product(labels, "BILU"), 1)}
+        ids_to_label = {
+            i: f"{s}-{label}" for i, (label, s) in enumerate(product(labels, "BILU"), 1)
+        }
         ids_to_label[0] = "O"
         return ids_to_label
 
@@ -324,8 +326,7 @@ class TokenClassificationDataset(Dataset):
         tokens_per_batch: int = 32,
         window_stride: Optional[int] = None,
     ):
-        """ tokenize_and_align_labels with long text (i.e. truncation is disabled)
-        """
+        """tokenize_and_align_labels with long text (i.e. truncation is disabled)"""
         self.features: List[InputFeatures] = []
         self.examples: List[TokenClassificationExample] = []
         texts: StrList = [ex.content for ex in examples]
@@ -334,11 +335,15 @@ class TokenClassificationDataset(Dataset):
         if window_stride is None:
             self.window_stride = tokens_per_batch
         elif window_stride > tokens_per_batch:
-            logger.error("window_stride must be smaller than tokens_per_batch(max_seq_length)")
+            logger.error(
+                "window_stride must be smaller than tokens_per_batch(max_seq_length)"
+            )
         else:
-            logger.warning("""window_stride != tokens_per_batch:
+            logger.warning(
+                """window_stride != tokens_per_batch:
             The input data windows are overlapping. Merge the overlapping labels after processing InputFeatures.
-            """)
+            """
+            )
 
         # tokenize text into subwords
         # NOTE: add_special_tokens
