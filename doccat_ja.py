@@ -63,7 +63,7 @@ class Split(Enum):
 
 
 @dataclass
-class InputExample:
+class SequenceClassificationExample:
     guid: str
     text: str
     label: str
@@ -121,13 +121,13 @@ class SequenceClassificationDataset(Dataset):
 
     def __init__(
         self,
-        data: List[InputExample],
+        data: List[SequenceClassificationExample],
         tokenizer: PreTrainedTokenizerFast,
         label_to_id: Dict[str, int],
         tokens_per_batch: int = 32,
     ):
         self.features: List[InputFeatures] = []
-        self.examples: List[InputExample] = data
+        self.examples: List[SequenceClassificationExample] = data
         texts: StrList = [ex.text for ex in self.examples]
         labels: StrList = [ex.label for ex in self.examples]
 
@@ -198,9 +198,9 @@ class SequenceClassificationDataModule(pl.LightningDataModule):
 
     def __init__(self, hparams: Namespace):
         self.tokenizer: PreTrainedTokenizerFast
-        self.train_examples: List[InputExample]
-        self.val_examples: List[InputExample]
-        self.test_examples: List[InputExample]
+        self.train_examples: List[SequenceClassificationExample]
+        self.val_examples: List[SequenceClassificationExample]
+        self.test_examples: List[SequenceClassificationExample]
         self.train_dataset: SequenceClassificationDataset
         self.val_dataset: SequenceClassificationDataset
         self.test_dataset: SequenceClassificationDataset
@@ -258,15 +258,15 @@ class SequenceClassificationDataModule(pl.LightningDataModule):
         )
 
         self.train_examples = [
-            InputExample(guid=f"train-{i}", text=t, label=l)
+            SequenceClassificationExample(guid=f"train-{i}", text=t, label=l)
             for i, (t, l) in df_train[[TEXT_COL_NAME, LABEL_COL_NAME]].iterrows()
         ]
         self.val_examples = [
-            InputExample(guid=f"val-{i}", text=t, label=l)
+            SequenceClassificationExample(guid=f"val-{i}", text=t, label=l)
             for i, (t, l) in df_val[[TEXT_COL_NAME, LABEL_COL_NAME]].iterrows()
         ]
         self.test_examples = [
-            InputExample(guid=f"test-{i}", text=t, label=l)
+            SequenceClassificationExample(guid=f"test-{i}", text=t, label=l)
             for i, (t, l) in df_test[[TEXT_COL_NAME, LABEL_COL_NAME]].iterrows()
         ]
 
@@ -276,7 +276,9 @@ class SequenceClassificationDataModule(pl.LightningDataModule):
 
         self.dataset_size = len(self.train_dataset)
 
-    def create_dataset(self, data: List[InputExample]) -> SequenceClassificationDataset:
+    def create_dataset(
+        self, data: List[SequenceClassificationExample]
+    ) -> SequenceClassificationDataset:
         return SequenceClassificationDataset(
             data,
             self.tokenizer,

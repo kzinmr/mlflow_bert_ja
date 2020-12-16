@@ -74,7 +74,7 @@ class StringSpanExample:
 
 
 @dataclass
-class TokenLabelExample:
+class TokenClassificationExample:
     guid: str
     words: StrList
     labels: StrList
@@ -155,7 +155,7 @@ def read_examples_from_file(
     label_idx: int = -1,
     delimiter: str = "\t",
     is_bio: bool = True,
-) -> List[TokenLabelExample]:
+) -> List[TokenClassificationExample]:
     """
     Read token-wise data like CoNLL2003 from file
     """
@@ -174,7 +174,7 @@ def read_examples_from_file(
             if is_boundary_line(line):
                 if words:
                     examples.append(
-                        TokenLabelExample(
+                        TokenClassificationExample(
                             guid=f"{mode}-{guid_index}", words=words, labels=labels
                         )
                     )
@@ -191,14 +191,16 @@ def read_examples_from_file(
                     labels.append("O")
         if words:
             examples.append(
-                TokenLabelExample(
+                TokenClassificationExample(
                     guid=f"{mode}-{guid_index}", words=words, labels=labels
                 )
             )
     return examples
 
 
-def convert_spandata(examples: List[TokenLabelExample]) -> List[StringSpanExample]:
+def convert_spandata(
+    examples: List[TokenClassificationExample],
+) -> List[StringSpanExample]:
     """
     Convert token-wise data like CoNLL2003 into string-wise span data
     """
@@ -314,7 +316,7 @@ class TokenClassificationDataset(Dataset):
         tokens_per_batch: int = 32,
     ):
         self.features: List[InputFeatures] = []
-        self.examples: List[TokenLabelExample] = []
+        self.examples: List[TokenClassificationExample] = []
         texts: StrList = [ex.content for ex in data]
         annotations: List[List[SpanAnnotation]] = [ex.annotations for ex in data]
 
@@ -356,7 +358,7 @@ class TokenClassificationDataset(Dataset):
                     label_token_aligner.ids_to_label[i] for i in label_ids[start:end]
                 ]
                 self.examples.append(
-                    TokenLabelExample(guid=guid, words=subwords, labels=labels)
+                    TokenClassificationExample(guid=guid, words=subwords, labels=labels)
                 )
         self._n_features = len(self.features)
 
@@ -401,9 +403,9 @@ class TokenClassificationDataModule(pl.LightningDataModule):
 
     def __init__(self, hparams: Namespace):
         self.tokenizer: PreTrainedTokenizerFast
-        self.train_examples: List[TokenLabelExample]
-        self.val_examples: List[TokenLabelExample]
-        self.test_examples: List[TokenLabelExample]
+        self.train_examples: List[TokenClassificationExample]
+        self.val_examples: List[TokenClassificationExample]
+        self.test_examples: List[TokenClassificationExample]
         self.train_data: List[StringSpanExample]
         self.val_data: List[StringSpanExample]
         self.test_data: List[StringSpanExample]
