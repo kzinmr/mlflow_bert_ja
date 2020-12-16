@@ -13,7 +13,7 @@ from seqeval.metrics import (
     accuracy_score,
     f1_score,
     precision_score,
-    recall_score
+    recall_score,
 )
 from torch.nn import CrossEntropyLoss
 from torch.utils.data import DataLoader, TensorDataset

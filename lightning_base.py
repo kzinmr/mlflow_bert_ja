@@ -18,14 +18,14 @@ from transformers import (
     AutoModelWithLMHead,
     AutoTokenizer,
     PretrainedConfig,
-    PreTrainedTokenizer
+    PreTrainedTokenizer,
 )
 from transformers.optimization import (
     Adafactor,
     get_cosine_schedule_with_warmup,
     get_cosine_with_hard_restarts_schedule_with_warmup,
     get_linear_schedule_with_warmup,
-    get_polynomial_decay_schedule_with_warmup
+    get_polynomial_decay_schedule_with_warmup,
 )
 
 # from transformers.utils.versions import require_version_examples

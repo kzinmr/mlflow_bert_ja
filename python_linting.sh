@@ -1,4 +1,4 @@
-isort -rc -sl .
+isort --force-single-line-imports .
 autoflake -ri --remove-all-unused-imports --ignore-init-module-imports --remove-unused-variables .
 black .
-isort -rc -m 3 .
+isort -m 3 --trailing-comma .

@@ -183,7 +183,7 @@ if __name__ == "__main__":
         AdamW,
         BatchEncoding,
         BertForTokenClassification,
-        BertTokenizerFast
+        BertTokenizerFast,
     )
 
     # input format

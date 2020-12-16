@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from pytorch_lightning.callbacks import (
     EarlyStopping,
     LearningRateMonitor,
-    ModelCheckpoint
+    ModelCheckpoint,
 )
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
