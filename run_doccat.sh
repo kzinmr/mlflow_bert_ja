@@ -1,24 +1,39 @@
-export TASK=mrpc
-export DATA_DIR=./glue_data/MRPC/
-export MAX_LENGTH=128
-export LEARNING_RATE=2e-5
-export BERT_MODEL=bert-base-cased
-export BATCH_SIZE=32
-export NUM_EPOCHS=3
-export SEED=2
-export OUTPUT_DIR_NAME=mrpc-pl-bert
-export OUTPUT_DIR=${PWD}/${OUTPUT_DIR_NAME}
+export BERT_MODEL=cl-tohoku/bert-base-japanese
+# export WORK_DIR=${PWD}
+export DATA_DIR=${WORK_DIR}/data/
+export OUTPUT_DIR=${WORK_DIR}/outputs/
+export CACHE=${WORK_DIR}/cache/
+export SEED=42
 mkdir -p $OUTPUT_DIR
+# In Docker, the following error occurs due to not big enough memory:
+# `RuntimeError: DataLoader worker is killed by signal: Killed.`
+# Try to reduce NUM_WORKERS or MAX_LENGTH or BATCH_SIZE or increase docker memory
+export NUM_WORKERS=4
+export GPUS=0
 
-python3 download_glue_data.py --tasks $TASK
+export MAX_LENGTH=128
+export BATCH_SIZE=32
+export LEARNING_RATE=5e-5
 
-python3 doccat.py --gpus 1 --data_dir $DATA_DIR \
---task $TASK \
---model_name_or_path $BERT_MODEL \
---output_dir $OUTPUT_DIR \
---max_seq_length  $MAX_LENGTH \
---learning_rate $LEARNING_RATE \
---num_train_epochs $NUM_EPOCHS \
---train_batch_size $BATCH_SIZE \
---seed $SEED \
---do_predict
+export NUM_EPOCHS=1
+export NUM_SAMPLES=100
+
+python3 doccat.py \
+--model_name_or_path=$BERT_MODEL \
+--output_dir=$OUTPUT_DIR \
+--accumulate_grad_batches=1 \
+--max_epochs=$NUM_EPOCHS \
+--seed=$SEED \
+--do_train \
+--do_predict \
+--cache_dir=$CACHE \
+--gpus=$GPUS \
+--data_dir=$DATA_DIR \
+--num_workers=$NUM_WORKERS \
+--max_seq_length=$MAX_LENGTH \
+--train_batch_size=$BATCH_SIZE \
+--eval_batch_size=$BATCH_SIZE \
+--learning_rate=$LEARNING_RATE \
+--adam_epsilon=1e-8 \
+--weight_decay=0.0 \
+--num_samples=$NUM_SAMPLES

@@ -61,5 +61,5 @@ COPY *.sh ./
 # RUN mkdir -p outputs/data
 # RUN mkdir -p outputs/models
 
-CMD ["bash", "./run_ner_ja.sh"]
+CMD ["bash", "./run_ner.sh"]
 # , "--gpus", "1"]
