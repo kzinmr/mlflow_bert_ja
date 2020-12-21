@@ -9,11 +9,11 @@ mkdir -p $OUTPUT_DIR
 # In Docker, the following error occurs due to not big enough memory:
 # `RuntimeError: DataLoader worker is killed by signal: Killed.`
 # Try to reduce NUM_WORKERS or MAX_LENGTH or BATCH_SIZE or increase docker memory
-export NUM_WORKERS=1
-export GPUS=0
+export NUM_WORKERS=8
+export GPUS=1
 
-export MAX_LENGTH=64
-export BATCH_SIZE=32
+export MAX_LENGTH=128
+export BATCH_SIZE=16
 export LEARNING_RATE=5e-5
 
 export NUM_EPOCHS=1

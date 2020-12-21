@@ -87,7 +87,7 @@ class InputFeatures:
     label_ids: IntList
 
 
-def download_dataset(data_dir: str):
+def download_dataset(data_dir: Union[str, Path]):
     def _download_data(url, file_path):
         response = requests.get(url)
         if response.ok:
@@ -440,8 +440,8 @@ class TokenClassificationDataModule(pl.LightningDataModule):
 
         super().__init__()
         self.max_seq_length = hparams.max_seq_length
-        self.cache_dir = hparams.cache_dir
-        if not os.path.exists(self.cache_dir):
+        self.cache_dir = hparams.cache_dir if hparams.cache_dir else None
+        if self.cache_dir is not None and not os.path.exists(self.cache_dir):
             os.mkdir(self.cache_dir)
         self.data_dir = hparams.data_dir
         if not os.path.exists(self.data_dir):
@@ -463,7 +463,13 @@ class TokenClassificationDataModule(pl.LightningDataModule):
             tokenize_chinese_chars=False,
             strip_accents=False,
         )
-        download_dataset(self.data_dir)
+        data_dir = Path(self.data_dir)
+        if (
+            not (data_dir / f"{Split.train.value}.txt").exists()
+            or not (data_dir / f"{Split.dev.value}.txt").exists()
+            or not (data_dir / f"{Split.test.value}.txt").exists()
+        ):
+            download_dataset(self.data_dir)
         self.train_examples = read_examples_from_file(self.data_dir, Split.train)
         self.val_examples = read_examples_from_file(self.data_dir, Split.dev)
         self.test_examples = read_examples_from_file(self.data_dir, Split.test)
@@ -623,11 +629,9 @@ class TokenClassificationModule(pl.LightningModule):
 
         self.step_count = 0
         self.output_dir = Path(self.hparams.output_dir)
-        self.cache_dir = None
-        if self.hparams.cache_dir:
-            if not os.path.exists(self.hparams.cache_dir):
-                os.mkdir(self.hparams.cache_dir)
-            self.cache_dir = self.hparams.cache_dir
+        self.cache_dir = self.hparams.cache_dir if self.hparams.cache_dir else None
+        if self.cache_dir is not None and not os.path.exists(self.hparams.cache_dir):
+                os.mkdir(self.cache_dir)
 
         # AutoTokenizer
         # trf>=4.0.0: PreTrainedTokenizerFast by default
