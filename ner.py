@@ -774,19 +774,18 @@ class TokenClassificationModule(pl.LightningModule):
                 lr=self.hparams.learning_rate,
                 eps=self.hparams.adam_epsilon,
             )
-        self.scheduler = {
-            "scheduler": ReduceLROnPlateau(
+        return {
+        'optimizer': self.optimizer,
+        'lr_scheduler': ReduceLROnPlateau(
                 self.optimizer,
                 mode="min",
-                factor=0.2,
-                patience=2,
+                factor=self.hparams.anneal_factor,
+                patience=self.hparams.patience,
                 min_lr=1e-6,
                 verbose=True,
             ),
-            "monitor": "val_loss",
+        'monitor': "val_loss",
         }
-
-        return [self.optimizer], [self.scheduler]
 
     @pl.utilities.rank_zero_only
     def on_save_checkpoint(self, checkpoint: Dict[str, Any]):
@@ -838,6 +837,18 @@ class TokenClassificationModule(pl.LightningModule):
             help="Epsilon for Adam optimizer.",
         )
         parser.add_argument("--adafactor", action="store_true")
+        parser.add_argument(
+            "--patience",
+            default=3,
+            type=int,
+            help="Number of epochs with no improvement after which learning rate will be reduced.",
+        )
+        parser.add_argument(
+            "--anneal_factor",
+            default=5e-5,
+            type=float,
+            help="Factor by which the learning rate will be reduced.",
+        )
         return parser
 
 
