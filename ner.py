@@ -7,7 +7,7 @@ from itertools import product, starmap
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-import mlflow.pytorch
+# import mlflow.pytorch
 import numpy as np
 import pytorch_lightning as pl
 import requests
@@ -948,7 +948,7 @@ if __name__ == "__main__":
     # Logs loss and any other metrics specified in the fit function,
     # and optimizer data as parameters. Model checkpoints are logged
     # as artifacts and pytorch model is stored under `model` directory.
-    mlflow.pytorch.autolog(log_every_n_epoch=1)
+    # mlflow.pytorch.autolog(log_every_n_epoch=1)
 
     dm = TokenClassificationDataModule(args)
     dm.prepare_data()
@@ -962,4 +962,6 @@ if __name__ == "__main__":
 
     if args.do_predict:
         # NOTE: load the best checkpoint automatically
-        trainer.test()
+        print(checkpoint_callback.best_model_path)
+        print(checkpoint_callback.best_model_score)
+        trainer.test(ckpt_path=checkpoint_callback.best_model_path)
