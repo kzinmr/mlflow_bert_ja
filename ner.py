@@ -773,6 +773,9 @@ class TokenClassificationModule(pl.LightningModule):
                 optimizer_grouped_parameters,
                 lr=self.hparams.learning_rate,
                 eps=self.hparams.adam_epsilon,
+                betas=(0.9, 0.999),
+                weight_decay=self.hparams.weight_decay,
+                amsgrad=False,
             )
         return {
         'optimizer': self.optimizer,
@@ -826,7 +829,7 @@ class TokenClassificationModule(pl.LightningModule):
         )
         parser.add_argument(
             "--learning_rate",
-            default=5e-5,
+            default=1e-3,
             type=float,
             help="The initial learning rate for Adam.",
         )
@@ -975,4 +978,4 @@ if __name__ == "__main__":
         # NOTE: load the best checkpoint automatically
         print(checkpoint_callback.best_model_path)
         print(checkpoint_callback.best_model_score)
-        trainer.test(ckpt_path=checkpoint_callback.best_model_path)
+        trainer.test()

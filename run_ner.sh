@@ -2,7 +2,7 @@ export BERT_MODEL=cl-tohoku/bert-base-japanese
 # export WORK_DIR=${PWD}
 export DATA_DIR=${WORK_DIR}/data/
 export OUTPUT_DIR=${WORK_DIR}/outputs/
-export CACHE=${WORK_DIR}/cache/
+# export CACHE=${WORK_DIR}/cache/
 export LABEL_PATH=$DATA_DIR/label_types.txt
 export SEED=42
 mkdir -p $OUTPUT_DIR
@@ -14,12 +14,13 @@ export GPUS=1
 
 export MAX_LENGTH=128
 export BATCH_SIZE=16
-export LEARNING_RATE=0.1
+export LEARNING_RATE=1e-3
+export WEIGHT_DECAY=0.01
 export PATIENCE=3
 export ANNEAL_FACTOR=0.5
 
-export NUM_EPOCHS=1
-export NUM_SAMPLES=100
+export NUM_EPOCHS=10
+export NUM_SAMPLES=15000
 
 python3 ner.py \
 --model_name_or_path=$BERT_MODEL \
@@ -29,7 +30,6 @@ python3 ner.py \
 --seed=$SEED \
 --do_train \
 --do_predict \
---cache_dir=$CACHE \
 --gpus=$GPUS \
 --data_dir=$DATA_DIR \
 --labels=$LABEL_PATH \
@@ -41,5 +41,5 @@ python3 ner.py \
 --patience=$PATIENCE \
 --anneal_factor=$ANNEAL_FACTOR \
 --adam_epsilon=1e-8 \
---weight_decay=0.0 \
+--weight_decay==$WEIGHT_DECAY \
 --num_samples=$NUM_SAMPLES
