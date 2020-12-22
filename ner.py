@@ -668,9 +668,10 @@ class TokenClassificationModule(pl.LightningModule):
             config=self.config,
             cache_dir=self.cache_dir,
         )
-
-        self.scheduler = None
-        self.optimizer = None
+        if self.hparams.freeze_pretrained:
+            for name, param in self.model.named_parameters():
+                if 'classifier' not in name:
+                    param.requires_grad = False
 
     def forward(self, **inputs) -> TokenClassifierOutput:
         """BertForTokenClassification.forward"""
@@ -852,6 +853,7 @@ class TokenClassificationModule(pl.LightningModule):
             type=float,
             help="Factor by which the learning rate will be reduced.",
         )
+        parser.add_argument("--freeze_pretrained", action="store_true")
         return parser
 
 

@@ -28,8 +28,6 @@ python3 ner.py \
 --accumulate_grad_batches=1 \
 --max_epochs=$NUM_EPOCHS \
 --seed=$SEED \
---do_train \
---do_predict \
 --gpus=$GPUS \
 --data_dir=$DATA_DIR \
 --labels=$LABEL_PATH \
@@ -42,4 +40,7 @@ python3 ner.py \
 --anneal_factor=$ANNEAL_FACTOR \
 --adam_epsilon=1e-8 \
 --weight_decay==$WEIGHT_DECAY \
---num_samples=$NUM_SAMPLES
+--num_samples=$NUM_SAMPLES \
+--freeze_pretrained \
+--do_predict \
+--do_train
