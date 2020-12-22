@@ -19,8 +19,8 @@ export WEIGHT_DECAY=0.01
 export PATIENCE=3
 export ANNEAL_FACTOR=0.5
 
-export NUM_EPOCHS=10
-export NUM_SAMPLES=15000
+export NUM_EPOCHS=30
+export NUM_SAMPLES=20000
 
 python3 ner.py \
 --model_name_or_path=$BERT_MODEL \
