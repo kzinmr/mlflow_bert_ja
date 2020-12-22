@@ -980,6 +980,14 @@ if __name__ == "__main__":
     best_model.model.save_pretrained(save_path)
     best_model.tokenizer.save_pretrained(save_path)
 
+    # decode results
+    with open(os.path.join(best_model.output_dir, 'test_predict.txt'), 'wt') as fp:
+        for batch in dm.test_dataloader():
+            tokens_batch, golds_batch, preds_batch = best_model.decode_batch(batch, dm.label_token_aligner.ids_to_label)
+            columns_batch = '\n\n'.join(['\n'.join([f'{t}\t{g}\t{p}' for t, g, p in zip(tokens, golds, preds)]) for tokens, golds, preds in zip(tokens_batch, golds_batch, preds_batch)])
+            fp.write(columns_batch)
+            fp.write('\n\n')
+
     if args.do_predict:
         # NOTE: load the best checkpoint automatically
         trainer.test(ckpt_path=checkpoint_callback.best_model_path)
