@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from enum import Enum
 from itertools import product, starmap
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, Generator, List, Optional, Tuple, Union
 
 import mlflow.pytorch
 import numpy as np
@@ -669,42 +669,6 @@ class TokenClassificationModule(pl.LightningModule):
         }
         return self.model(**inputs)
 
-    def decode_batch(
-        self, batch: InputFeaturesBatch, id_to_label: Dict[int, str]
-    ) -> Tuple[StrListList, StrListList, StrListList]:
-        def _convert_label(label_ids: IntList, id_to_label: Dict[int, str]) -> StrList:
-            return [
-                id_to_label[label_id]
-                for label_id in label_ids
-                if label_id != PAD_TOKEN_LABEL_ID
-            ]
-
-        output = self.forward_from_features(batch)
-        logits_batch = output.logits.detach().cpu().numpy()
-        input_ids_batch = batch.input_ids.detach().cpu().numpy()
-        label_ids_batch = batch.label_ids.detach().cpu().numpy()
-        preds_batch = list(
-            map(
-                lambda ids: _convert_label(ids, id_to_label),
-                np.argmax(logits_batch, axis=2),
-            )
-        )
-        tokens_batch: StrListList = list(
-            map(
-                lambda x: [xx for xx in x if xx != PAD_TOKEN],
-                map(self.tokenizer.convert_ids_to_tokens, input_ids_batch),
-            )
-        )
-        preds_batch = [
-            preds[: len(tokens)] for preds, tokens in zip(preds_batch, tokens_batch)
-        ]
-        golds_batch = list(
-            map(lambda ids: _convert_label(ids, id_to_label), label_ids_batch)
-        )
-        assert len(preds_batch[0]) == len(tokens_batch[0])
-        assert len(preds_batch[0]) == len(golds_batch[0])
-        return tokens_batch, golds_batch, preds_batch
-
     def training_step(
         self, train_batch: InputFeaturesBatch, batch_idx
     ) -> Dict[str, torch.Tensor]:
@@ -758,6 +722,51 @@ class TokenClassificationModule(pl.LightningModule):
         self.log("test_precision", precision)
         self.log("test_recall", recall)
         self.log("test_f1", f1)
+
+    def predict_step(self, batch: InputFeaturesBatch) -> Dict[str, torch.Tensor]:
+        output = self.forward_from_features(batch)
+        return {
+            "pred": output.logits,
+            "label_ids": batch.label_ids,
+            "input_ids": batch.input_ids,
+        }
+
+    def predict(
+        self, dataloader, id_to_label: Dict[int, str]
+    ) -> Generator[Tuple[StrListList, StrListList, StrListList], None, None]:
+        def _convert_label(label_ids: IntList, id_to_label: Dict[int, str]) -> StrList:
+            return [
+                id_to_label[label_id]
+                for label_id in label_ids
+                if label_id != PAD_TOKEN_LABEL_ID
+            ]
+
+        outputs = [self.predict_step(batch) for batch in dataloader]
+        for output in outputs:
+            logits_batch = output["pred"].detach().cpu().numpy()
+            input_ids_batch = output["input_ids"].detach().cpu().numpy()
+            label_ids_batch = output["label_ids"].detach().cpu().numpy()
+            preds_batch = list(
+                map(
+                    lambda ids: _convert_label(ids, id_to_label),
+                    np.argmax(logits_batch, axis=2),
+                )
+            )
+            tokens_batch: StrListList = list(
+                map(
+                    lambda x: [xx for xx in x if xx != PAD_TOKEN],
+                    map(self.tokenizer.convert_ids_to_tokens, input_ids_batch),
+                )
+            )
+            preds_batch = [
+                preds[: len(tokens)] for preds, tokens in zip(preds_batch, tokens_batch)
+            ]
+            golds_batch = list(
+                map(lambda ids: _convert_label(ids, id_to_label), label_ids_batch)
+            )
+            assert len(preds_batch[0]) == len(tokens_batch[0])
+            assert len(preds_batch[0]) == len(golds_batch[0])
+            yield (tokens_batch, golds_batch, preds_batch)
 
     def configure_optimizers(self):
         """Prepare optimizer and schedule (linear warmup and decay)"""
@@ -985,10 +994,10 @@ if __name__ == "__main__":
     # decode results
     golds, preds = [], []
     with open(os.path.join(best_model.output_dir, "test_predict.txt"), "wt") as fp:
-        for batch in dm.test_dataloader():
-            tokens_batch, golds_batch, preds_batch = best_model.decode_batch(
-                batch, dm.label_token_aligner.ids_to_label
-            )
+        id_to_label = dm.label_token_aligner.ids_to_label
+        for tokens_batch, golds_batch, preds_batch in best_model.predict(
+            dm.test_dataloader(), id_to_label
+        ):
             columns_batch = "\n\n".join(
                 [
                     "\n".join(
