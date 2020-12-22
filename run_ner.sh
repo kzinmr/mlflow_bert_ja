@@ -39,7 +39,7 @@ python3 ner.py \
 --patience=$PATIENCE \
 --anneal_factor=$ANNEAL_FACTOR \
 --adam_epsilon=1e-8 \
---weight_decay==$WEIGHT_DECAY \
+--weight_decay=$WEIGHT_DECAY \
 --num_samples=$NUM_SAMPLES \
 --freeze_pretrained \
 --do_predict \
