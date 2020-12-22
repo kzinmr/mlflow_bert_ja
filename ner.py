@@ -679,7 +679,7 @@ class TokenClassificationModule(pl.LightningModule):
                 if label_id != PAD_TOKEN_LABEL_ID
             ]
 
-        output = self.model.forward_from_features(batch)
+        output = self.forward_from_features(batch)
         logits_batch = output.logits.detach().cpu().numpy()
         input_ids_batch = batch.input_ids.detach().cpu().numpy()
         label_ids_batch = batch.label_ids.detach().cpu().numpy()
