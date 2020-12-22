@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from enum import Enum
 from itertools import product, starmap
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import mlflow.pytorch
 import numpy as np
@@ -971,22 +971,42 @@ if __name__ == "__main__":
     trainer, checkpoint_callback = make_trainer(args)
 
     trainer.fit(model, dm)
-    logger.info('Best checkpoint path: {}'.format(checkpoint_callback.best_model_path))
-    logger.info('Best score(val loss): {}'.format(checkpoint_callback.best_model_score))
+    logger.info("Best checkpoint path: {}".format(checkpoint_callback.best_model_path))
+    logger.info("Best score(val loss): {}".format(checkpoint_callback.best_model_score))
     # save best model
-    best_model = TokenClassificationModule.load_from_checkpoint(checkpoint_callback.best_model_path)
+    best_model = TokenClassificationModule.load_from_checkpoint(
+        checkpoint_callback.best_model_path
+    )
     save_path = best_model.output_dir.joinpath("best_tfmr")
     best_model.model.config.save_step = best_model.step_count
     best_model.model.save_pretrained(save_path)
     best_model.tokenizer.save_pretrained(save_path)
 
     # decode results
-    with open(os.path.join(best_model.output_dir, 'test_predict.txt'), 'wt') as fp:
+    golds, preds = [], []
+    with open(os.path.join(best_model.output_dir, "test_predict.txt"), "wt") as fp:
         for batch in dm.test_dataloader():
-            tokens_batch, golds_batch, preds_batch = best_model.decode_batch(batch, dm.label_token_aligner.ids_to_label)
-            columns_batch = '\n\n'.join(['\n'.join([f'{t}\t{g}\t{p}' for t, g, p in zip(tokens, golds, preds)]) for tokens, golds, preds in zip(tokens_batch, golds_batch, preds_batch)])
+            tokens_batch, golds_batch, preds_batch = best_model.decode_batch(
+                batch, dm.label_token_aligner.ids_to_label
+            )
+            columns_batch = "\n\n".join(
+                [
+                    "\n".join(
+                        [f"{t}\t{g}\t{p}" for t, g, p in zip(tokens, golds, preds)]
+                    )
+                    for tokens, golds, preds in zip(
+                        tokens_batch, golds_batch, preds_batch
+                    )
+                ]
+            )
             fp.write(columns_batch)
-            fp.write('\n\n')
+            fp.write("\n\n")
+            golds.extend(golds_batch)
+            preds.extend(preds_batch)
+    precision = precision_score(golds, preds, mode="strict", scheme=BILOU)
+    recall = recall_score(golds, preds, mode="strict", scheme=BILOU)
+    f1 = f1_score(golds, preds, mode="strict", scheme=BILOU)
+    print(precision, recall, f1)
 
     if args.do_predict:
         # NOTE: load the best checkpoint automatically
