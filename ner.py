@@ -7,17 +7,15 @@ from itertools import product, starmap
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-# import mlflow.pytorch
+import mlflow.pytorch
 import numpy as np
 import pytorch_lightning as pl
 import requests
 import torch
 from pytorch_lightning.callbacks import (
-    EarlyStopping,
     LearningRateMonitor,
     ModelCheckpoint,
 )
-from pytorch_lightning.utilities import rank_zero_info
 from seqeval.metrics import (
     accuracy_score,
     f1_score,
@@ -29,6 +27,7 @@ from tokenizers import Encoding
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Dataset
 from transformers import (
+    Adafactor,
     AdamW,
     BatchEncoding,
     BertConfig,
@@ -39,7 +38,7 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 from transformers.modeling_outputs import TokenClassifierOutput
-from transformers.optimization import Adafactor
+
 
 # huggingface/tokenizers: Disabling parallelism to avoid deadlocks.
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -582,28 +581,15 @@ class TokenClassificationDataModule(pl.LightningDataModule):
         )
         parser.add_argument(
             "--max_seq_length",
-            default=256,
+            default=64,
             type=int,
             help="The maximum total input sequence length after tokenization. Sequences longer "
             "than this will be truncated, sequences shorter will be padded.",
         )
         parser.add_argument(
-            "--labels",
-            default="",
-            type=str,
-            help="Path to a file containing all labels. If not specified, CoNLL-2003 labels are used.",
-        )
-        parser.add_argument(
-            "--data_dir",
-            default="data",
-            type=str,
-            required=True,
-            help="The input data dir. Should contain the training files for the CoNLL-2003 NER task.",
-        )
-        parser.add_argument(
             "--num_samples",
             type=int,
-            default=15000,
+            default=100,
             metavar="N",
             help="Number of samples to be used for training and evaluation steps (default: 15000) Maximum:100000",
         )
@@ -677,7 +663,7 @@ class TokenClassificationModule(pl.LightningModule):
         """BertForTokenClassification.forward"""
         return self.model(**inputs)
 
-    def shared_step(self, batch: InputFeaturesBatch) -> TokenClassifierOutput:
+    def forward_from_features(self, batch: InputFeaturesBatch) -> TokenClassifierOutput:
         # .to(self.device) is not necessary with pl.Traner ??
         inputs = {
             "input_ids": batch.input_ids.to(self.device),
@@ -689,7 +675,7 @@ class TokenClassificationModule(pl.LightningModule):
     def training_step(
         self, train_batch: InputFeaturesBatch, batch_idx
     ) -> Dict[str, torch.Tensor]:
-        output = self.shared_step(train_batch)
+        output = self.forward_from_features(train_batch)
         loss = output.loss
         self.log("train_loss", loss, prog_bar=True)
         return {"loss": loss}
@@ -697,7 +683,7 @@ class TokenClassificationModule(pl.LightningModule):
     def validation_step(
         self, val_batch: InputFeaturesBatch, batch_idx
     ) -> Dict[str, torch.Tensor]:
-        output = self.shared_step(val_batch)
+        output = self.forward_from_features(val_batch)
         return {
             "val_step_loss": output.loss,
         }
@@ -709,7 +695,7 @@ class TokenClassificationModule(pl.LightningModule):
     def test_step(
         self, test_batch: InputFeaturesBatch, batch_idx
     ) -> Dict[str, torch.Tensor]:
-        output = self.shared_step(test_batch)
+        output = self.forward_from_features(test_batch)
         return {"pred": output.logits, "target": test_batch.label_ids}
 
     def test_epoch_end(self, outputs: List[Dict[str, torch.Tensor]]):
@@ -776,7 +762,7 @@ class TokenClassificationModule(pl.LightningModule):
                 eps=self.hparams.adam_epsilon,
                 betas=(0.9, 0.999),
                 weight_decay=self.hparams.weight_decay,
-                amsgrad=False,
+                # amsgrad=False,
             )
         return {
         'optimizer': self.optimizer,
@@ -793,6 +779,8 @@ class TokenClassificationModule(pl.LightningModule):
 
     @pl.utilities.rank_zero_only
     def on_save_checkpoint(self, checkpoint: Dict[str, Any]):
+        """ checkpoint保存時(ModelCheckpointの監視で改善がみられた時)にモデルを保存
+        """
         save_path = self.output_dir.joinpath("best_tfmr")
         self.model.config.save_step = self.step_count
         self.model.save_pretrained(save_path)
@@ -857,60 +845,28 @@ class TokenClassificationModule(pl.LightningModule):
         return parser
 
 
-class LoggingCallback(pl.Callback):
-    # def on_batch_end(self, trainer, pl_module):
-    #     lr_scheduler = trainer.lr_schedulers[0]["scheduler"]
-    #     # lrs = {f"lr_group_{i}": lr for i, lr in enumerate(lr_scheduler.get_lr())}
-    #     # pl_module.logger.log_metrics(lrs)
-    #     pl_module.logger.log_metrics({"last_lr": lr_scheduler._last_lr})
-
-    def on_validation_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
-        rank_zero_info("***** Validation results *****")
-        metrics = trainer.callback_metrics
-        # Log results
-        for key in sorted(metrics):
-            rank_zero_info("{} = {}\n".format(key, str(metrics[key])))
-
-    def on_test_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
-        rank_zero_info("***** Test results *****")
-        metrics = trainer.callback_metrics
-        # Log and save results to file
-        output_test_results_file = os.path.join(
-            pl_module.hparams.output_dir, "test_results.txt"
-        )
-        with open(output_test_results_file, "w") as writer:
-            for key in sorted(metrics):
-                rank_zero_info("{} = {}\n".format(key, str(metrics[key])))
-                writer.write("{} = {}\n".format(key, str(metrics[key])))
-
-
 def make_trainer(argparse_args: Namespace):
     """
     Prepare pl.Trainer with callbacks and args
     """
 
-    early_stopping = EarlyStopping(monitor="val_loss", mode="min", verbose=True)
+    # early_stopping = EarlyStopping(monitor="val_loss", mode="min", verbose=True)
 
     checkpoint_callback = ModelCheckpoint(
         dirpath=argparse_args.output_dir,
         filename="checkpoint-{epoch}-{val_loss:.2f}",
-        save_top_k=1,
+        save_top_k=10,
         verbose=True,
         monitor="val_loss",
         mode="min",
     )
-    lr_logger = LearningRateMonitor()
-    logging_callback = LoggingCallback()
-
-    train_params = {"deterministic": True}
-    if args.gpus > 1:
-        train_params["distributed_backend"] = "ddp"
-    train_params["accumulate_grad_batches"] = args.accumulate_grad_batches
+    lr_logger = LearningRateMonitor(logging_interval='step')
 
     trainer = pl.Trainer.from_argparse_args(
         argparse_args,
-        callbacks=[lr_logger, early_stopping, checkpoint_callback, logging_callback],
-        **train_params,
+        callbacks=[lr_logger, checkpoint_callback],
+        deterministic=True,
+        accumulate_grad_batches=args.accumulate_grad_batches,
     )
     return trainer, checkpoint_callback
 
@@ -934,6 +890,19 @@ if __name__ == "__main__":
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument(
+        "--data_dir",
+        default="workspace/data",
+        type=str,
+        required=True,
+        help="The input data dir. Should contain the training files for the CoNLL-2003 NER task.",
+    )
+    parser.add_argument(
+        "--labels",
+        default="workspace/data/label_types.txt",
+        type=str,
+        help="Path to a file containing all labels. If not specified, CoNLL-2003 labels are used.",
+    )
+    parser.add_argument(
         "--cache_dir",
         default="",
         type=str,
@@ -955,6 +924,7 @@ if __name__ == "__main__":
     parser = TokenClassificationModule.add_model_specific_args(parent_parser=parser)
     parser = TokenClassificationDataModule.add_model_specific_args(parent_parser=parser)
     args = parser.parse_args()
+    # args = parser.parse_args(args=[])  # in jupyter notebook
 
     # sets seeds for numpy, torch, python.random and PYTHONHASHSEED.
     pl.seed_everything(args.seed)
@@ -964,7 +934,9 @@ if __name__ == "__main__":
     # Logs loss and any other metrics specified in the fit function,
     # and optimizer data as parameters. Model checkpoints are logged
     # as artifacts and pytorch model is stored under `model` directory.
-    # mlflow.pytorch.autolog(log_every_n_epoch=1)
+    mlflow.set_tracking_uri(os.environ['MLFLOW_TRACKING_URI'])
+    mlflow.set_experiment('trf-ner')
+    mlflow.pytorch.autolog(log_every_n_epoch=1)
 
     dm = TokenClassificationDataModule(args)
     dm.prepare_data()
