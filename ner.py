@@ -726,6 +726,7 @@ class TokenClassificationModule(pl.LightningModule):
     def predict_step(self, batch: InputFeaturesBatch) -> Dict[str, torch.Tensor]:
         output = self.forward_from_features(batch)
         return {
+            "loss": output.loss,
             "pred": output.logits,
             "label_ids": batch.label_ids,
             "input_ids": batch.input_ids,
@@ -742,7 +743,9 @@ class TokenClassificationModule(pl.LightningModule):
             ]
 
         outputs = [self.predict_step(batch) for batch in dataloader]
+        loss_avg = []
         for output in outputs:
+            loss_avg.append(output['loss'].detach().cpu().numpy().tolist())
             logits_batch = output["pred"].detach().cpu().numpy()
             input_ids_batch = output["input_ids"].detach().cpu().numpy()
             label_ids_batch = output["label_ids"].detach().cpu().numpy()
@@ -767,6 +770,7 @@ class TokenClassificationModule(pl.LightningModule):
             assert len(preds_batch[0]) == len(tokens_batch[0])
             assert len(preds_batch[0]) == len(golds_batch[0])
             yield (tokens_batch, golds_batch, preds_batch)
+        print('Loss on prediction: {}'.format(np.mean(loss_avg)))
 
     def configure_optimizers(self):
         """Prepare optimizer and schedule (linear warmup and decay)"""
