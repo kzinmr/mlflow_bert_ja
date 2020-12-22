@@ -5,17 +5,14 @@ from dataclasses import dataclass
 from enum import Enum
 from itertools import product, starmap
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlflow.pytorch
 import numpy as np
 import pytorch_lightning as pl
 import requests
 import torch
-from pytorch_lightning.callbacks import (
-    LearningRateMonitor,
-    ModelCheckpoint,
-)
+from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from seqeval.metrics import (
     accuracy_score,
     f1_score,
@@ -39,7 +36,6 @@ from transformers import (
 )
 from transformers.modeling_outputs import TokenClassifierOutput
 
-
 # huggingface/tokenizers: Disabling parallelism to avoid deadlocks.
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -50,6 +46,7 @@ IntListList = List[IntList]
 StrList = List[str]
 StrListList = List[StrList]
 PAD_TOKEN_LABEL_ID = -100
+PAD_TOKEN = "[PAD]"
 
 
 class Split(Enum):
@@ -617,7 +614,7 @@ class TokenClassificationModule(pl.LightningModule):
         self.output_dir = Path(self.hparams.output_dir)
         self.cache_dir = self.hparams.cache_dir if self.hparams.cache_dir else None
         if self.cache_dir is not None and not os.path.exists(self.hparams.cache_dir):
-                os.mkdir(self.cache_dir)
+            os.mkdir(self.cache_dir)
 
         # AutoTokenizer
         # trf>=4.0.0: PreTrainedTokenizerFast by default
@@ -656,7 +653,7 @@ class TokenClassificationModule(pl.LightningModule):
         )
         if self.hparams.freeze_pretrained:
             for name, param in self.model.named_parameters():
-                if 'classifier' not in name:
+                if "classifier" not in name:
                     param.requires_grad = False
 
     def forward(self, **inputs) -> TokenClassifierOutput:
@@ -671,6 +668,42 @@ class TokenClassificationModule(pl.LightningModule):
             "labels": batch.label_ids.to(self.device),
         }
         return self.model(**inputs)
+
+    def decode_batch(
+        self, batch: InputFeaturesBatch, id_to_label: Dict[int, str]
+    ) -> Tuple[StrListList, StrListList, StrListList]:
+        def _convert_label(label_ids: IntList, id_to_label: Dict[int, str]) -> StrList:
+            return [
+                id_to_label[label_id]
+                for label_id in label_ids
+                if label_id != PAD_TOKEN_LABEL_ID
+            ]
+
+        output = self.model.forward_from_features(batch)
+        logits_batch = output.logits.detach().cpu().numpy()
+        input_ids_batch = batch.input_ids.detach().cpu().numpy()
+        label_ids_batch = batch.label_ids.detach().cpu().numpy()
+        preds_batch = list(
+            map(
+                lambda ids: _convert_label(ids, id_to_label),
+                np.argmax(logits_batch, axis=2),
+            )
+        )
+        tokens_batch: StrListList = list(
+            map(
+                lambda x: [xx for xx in x if xx != PAD_TOKEN],
+                map(self.tokenizer.convert_ids_to_tokens, input_ids_batch),
+            )
+        )
+        preds_batch = [
+            preds[: len(tokens)] for preds, tokens in zip(preds_batch, tokens_batch)
+        ]
+        golds_batch = list(
+            map(lambda ids: _convert_label(ids, id_to_label), label_ids_batch)
+        )
+        assert len(preds_batch[0]) == len(tokens_batch[0])
+        assert len(preds_batch[0]) == len(golds_batch[0])
+        return tokens_batch, golds_batch, preds_batch
 
     def training_step(
         self, train_batch: InputFeaturesBatch, batch_idx
@@ -765,26 +798,17 @@ class TokenClassificationModule(pl.LightningModule):
                 # amsgrad=False,
             )
         return {
-        'optimizer': self.optimizer,
-        'lr_scheduler': ReduceLROnPlateau(
+            "optimizer": self.optimizer,
+            "lr_scheduler": ReduceLROnPlateau(
                 self.optimizer,
                 mode="min",
                 factor=self.hparams.anneal_factor,
                 patience=self.hparams.patience,
-                min_lr=1e-6,
+                min_lr=1e-5,
                 verbose=True,
             ),
-        'monitor': "val_loss",
+            "monitor": "val_loss",
         }
-
-    @pl.utilities.rank_zero_only
-    def on_save_checkpoint(self, checkpoint: Dict[str, Any]):
-        """ checkpoint保存時(ModelCheckpointの監視で改善がみられた時)にモデルを保存
-        """
-        save_path = self.output_dir.joinpath("best_tfmr")
-        self.model.config.save_step = self.step_count
-        self.model.save_pretrained(save_path)
-        self.tokenizer.save_pretrained(save_path)
 
     @staticmethod
     def add_model_specific_args(parent_parser):
@@ -860,7 +884,7 @@ def make_trainer(argparse_args: Namespace):
         monitor="val_loss",
         mode="min",
     )
-    lr_logger = LearningRateMonitor(logging_interval='step')
+    lr_logger = LearningRateMonitor(logging_interval="step")
 
     trainer = pl.Trainer.from_argparse_args(
         argparse_args,
@@ -934,8 +958,8 @@ if __name__ == "__main__":
     # Logs loss and any other metrics specified in the fit function,
     # and optimizer data as parameters. Model checkpoints are logged
     # as artifacts and pytorch model is stored under `model` directory.
-    mlflow.set_tracking_uri(os.environ['MLFLOW_TRACKING_URI'])
-    mlflow.set_experiment('trf-ner')
+    mlflow.set_tracking_uri(os.environ["MLFLOW_TRACKING_URI"])
+    mlflow.set_experiment("trf-ner")
     mlflow.pytorch.autolog(log_every_n_epoch=1)
 
     dm = TokenClassificationDataModule(args)
@@ -947,9 +971,15 @@ if __name__ == "__main__":
     trainer, checkpoint_callback = make_trainer(args)
 
     trainer.fit(model, dm)
+    logger.info('Best checkpoint path: {}'.format(checkpoint_callback.best_model_path))
+    logger.info('Best score(val loss): {}'.format(checkpoint_callback.best_model_score))
+    # save best model
+    best_model = TokenClassificationModule.load_from_checkpoint(checkpoint_callback.best_model_path)
+    save_path = best_model.output_dir.joinpath("best_tfmr")
+    best_model.model.config.save_step = best_model.step_count
+    best_model.model.save_pretrained(save_path)
+    best_model.tokenizer.save_pretrained(save_path)
 
     if args.do_predict:
         # NOTE: load the best checkpoint automatically
-        print(checkpoint_callback.best_model_path)
-        print(checkpoint_callback.best_model_score)
-        trainer.test()
+        trainer.test(ckpt_path=checkpoint_callback.best_model_path)
