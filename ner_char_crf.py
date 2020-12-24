@@ -288,7 +288,10 @@ class CharCRF:
     def convert_feature_line(self, text: str) -> List[Dict[str, str]]:
         """文字レベルに対して、品詞など単語レベルの情報をBIO形式や単語表層の形で付与する"""
         # parse and align tokens with characters
-        ts, fs = zip(*self.parse_full(text))
+        tfs = self.parse_full(text)
+        if len(tfs) == 0:
+            return []
+        ts, fs = zip(*tfs)
         featuremap = {k: v for k, v in enumerate(fs)}
         featuremap[-1] = "*,*,*,*,*,*,*,*,*"
         ts_spans = textspan.get_original_spans(ts, text)
