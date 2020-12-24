@@ -390,10 +390,6 @@ class CharCRF:
         annotations = data.annotations
         x = self.extract_features(text)
         y = self.get_biolu_from_spans(len(x), annotations)
-        if len(x) != len(y):
-            print(text)
-            print(y)
-            print(len(text), len(x), len(y))
         return x, y
 
     def fit(self, dataset: List[StringSpanExample]):
@@ -461,9 +457,9 @@ class CharCRF:
             n_sample = min(n_train, len(train_examples))
             train_examples = random.sample(train_examples, n_sample)
 
-        chars = [ex.content for ex in train_char_examples]
-        print(chars[:1])
-        print(self.create_features(train_char_examples[0]))
+        # chars = [ex.content for ex in train_char_examples]
+        # print(chars[:1])
+        # print(self.create_features(train_char_examples[0]))
 
         mlflow.set_tracking_uri(os.environ["MLFLOW_TRACKING_URI"])
         # 使う訓練データの量を徐々に増やす実験を行う
