@@ -13,13 +13,10 @@ import pytorch_lightning as pl
 import requests
 import torch
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
-from seqeval.metrics import (
-    accuracy_score,
-    f1_score,
-    precision_score,
-    recall_score,
-)
-from seqeval.metrics import classification_report as seqeval_classification_report
+from seqeval.metrics import accuracy_score
+from seqeval.metrics import \
+    classification_report as seqeval_classification_report
+from seqeval.metrics import f1_score, precision_score, recall_score
 from seqeval.scheme import BILOU
 from sklearn_crfsuite import metrics as crfsuite_metrics
 from tokenizers import Encoding
@@ -747,7 +744,7 @@ class TokenClassificationModule(pl.LightningModule):
         outputs = [self.predict_step(batch) for batch in dataloader]
         loss_avg = []
         for output in outputs:
-            loss_avg.append(output['loss'].detach().cpu().numpy().tolist())
+            loss_avg.append(output["loss"].detach().cpu().numpy().tolist())
             logits_batch = output["pred"].detach().cpu().numpy()
             input_ids_batch = output["input_ids"].detach().cpu().numpy()
             label_ids_batch = output["label_ids"].detach().cpu().numpy()
@@ -772,7 +769,7 @@ class TokenClassificationModule(pl.LightningModule):
             assert len(preds_batch[0]) == len(tokens_batch[0])
             assert len(preds_batch[0]) == len(golds_batch[0])
             yield (tokens_batch, golds_batch, preds_batch)
-        print('Loss on prediction: {}'.format(np.mean(loss_avg)))
+        print("Loss on prediction: {}".format(np.mean(loss_avg)))
 
     def configure_optimizers(self):
         """Prepare optimizer and schedule (linear warmup and decay)"""
@@ -1026,7 +1023,7 @@ if __name__ == "__main__":
 
     # chunk-wise (seqeval)
     seqeval_report = seqeval_classification_report(
-        golds, preds, digits=4, mode='strict', scheme=BILOU
+        golds, preds, digits=4, mode="strict", scheme=BILOU
     )
     print(seqeval_report)
     # tag-wise (sklearn_crfsuite)

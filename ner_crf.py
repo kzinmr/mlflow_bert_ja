@@ -3,10 +3,10 @@ import os
 import random
 import tempfile
 from argparse import ArgumentParser, Namespace
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Union
 
 import jsonlines
 import mlflow.pytorch
@@ -14,12 +14,10 @@ import numpy as np
 import pandas as pd
 import requests
 import sklearn_crfsuite
-
-from seqeval.metrics import classification_report as seqeval_classification_report
-
+from seqeval.metrics import \
+    classification_report as seqeval_classification_report
 from seqeval.scheme import BILOU
 from sklearn_crfsuite import metrics as crfsuite_metrics
-
 
 logger = logging.getLogger(__name__)
 
@@ -28,12 +26,13 @@ IntListList = List[IntList]
 StrList = List[str]
 StrListList = List[StrList]
 
+
 def seed_everything(seed: int = 1234):
-    """乱数固定
-    """
+    """乱数固定"""
     random.seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
     np.random.seed(seed)
+
 
 class Split(Enum):
     train = "train"
@@ -169,7 +168,7 @@ class CRF:
         self.hparams = hparams
 
         self.model = sklearn_crfsuite.CRF(
-            algorithm='lbfgs',
+            algorithm="lbfgs",
             c1=hparams.c1,
             c2=hparams.c2,
             max_iterations=hparams.max_iterations,
@@ -181,33 +180,37 @@ class CRF:
         word = sent[i]
 
         features = {
-            'bias': 1.0,
-            'word.lower()': word.lower(),
-            'word[-3:]': word[-3:],
-            'word[-2:]': word[-2:],
-            'word.isupper()': word.isupper(),
-            'word.istitle()': word.istitle(),
-            'word.isdigit()': word.isdigit(),
+            "bias": 1.0,
+            "word.lower()": word.lower(),
+            "word[-3:]": word[-3:],
+            "word[-2:]": word[-2:],
+            "word.isupper()": word.isupper(),
+            "word.istitle()": word.istitle(),
+            "word.isdigit()": word.isdigit(),
         }
         if i > 0:
-            word1 = sent[i-1][0]
-            features.update({
-                '-1:word.lower()': word1.lower(),
-                '-1:word.istitle()': word1.istitle(),
-                '-1:word.isupper()': word1.isupper(),
-            })
+            word1 = sent[i - 1][0]
+            features.update(
+                {
+                    "-1:word.lower()": word1.lower(),
+                    "-1:word.istitle()": word1.istitle(),
+                    "-1:word.isupper()": word1.isupper(),
+                }
+            )
         else:
-            features['BOS'] = True
+            features["BOS"] = True
 
-        if i < len(sent)-1:
-            word1 = sent[i+1][0]
-            features.update({
-                '+1:word.lower()': word1.lower(),
-                '+1:word.istitle()': word1.istitle(),
-                '+1:word.isupper()': word1.isupper(),
-            })
+        if i < len(sent) - 1:
+            word1 = sent[i + 1][0]
+            features.update(
+                {
+                    "+1:word.lower()": word1.lower(),
+                    "+1:word.istitle()": word1.istitle(),
+                    "+1:word.isupper()": word1.isupper(),
+                }
+            )
         else:
-            features['EOS'] = True
+            features["EOS"] = True
 
         return features
 
@@ -224,13 +227,17 @@ class CRF:
 
     @staticmethod
     def convert_report_df(report_str: str) -> pd.DataFrame:
-        lines = list(filter(None, report_str.split('\n')))
-        columns = list(filter(None, lines[0].split(' ')))
-        metrics = [list(filter(None, ls.split(' '))) for ls in lines[1:]]
-        each_metrics = [ls for ls in metrics if ls[0] not in {'accuracy', 'macro', 'weighted', 'micro'}]
-        macro_metrics = [['macro'] + ls[2:] for ls in metrics if ls[0] in {'macro'}]
-        micro_metrics = [['weighted'] + ls[2:] for ls in metrics if ls[0] == 'weighted']
-        all_metrics = each_metrics+macro_metrics+micro_metrics
+        lines = list(filter(None, report_str.split("\n")))
+        columns = list(filter(None, lines[0].split(" ")))
+        metrics = [list(filter(None, ls.split(" "))) for ls in lines[1:]]
+        each_metrics = [
+            ls
+            for ls in metrics
+            if ls[0] not in {"accuracy", "macro", "weighted", "micro"}
+        ]
+        macro_metrics = [["macro"] + ls[2:] for ls in metrics if ls[0] in {"macro"}]
+        micro_metrics = [["weighted"] + ls[2:] for ls in metrics if ls[0] == "weighted"]
+        all_metrics = each_metrics + macro_metrics + micro_metrics
         index = [ls[0] for ls in all_metrics]
         all_metrics = [list(map(float, ls[1:])) for ls in all_metrics]
         df = pd.DataFrame(all_metrics, index=index)
@@ -247,7 +254,7 @@ class CRF:
 
     def do_experiment(
         self,
-        n_train = -1,
+        n_train=-1,
         experiment_name: str = "NER with CRF",
     ):
         """
@@ -270,10 +277,7 @@ class CRF:
         if n_train > 0:
             n_sample = min(n_train, len(train_examples))
             train_examples = random.sample(train_examples, n_sample)
-        datasize = len(train_examples)
 
-        # MLflow Trackingの初期化
-        
         mlflow.set_tracking_uri(os.environ["MLFLOW_TRACKING_URI"])
         # 使う訓練データの量を徐々に増やす実験を行う
         # mlflowに実験内容を登録
@@ -286,13 +290,13 @@ class CRF:
             train_path = tmpdir / "train.jsonl"
             val_path = tmpdir / "val.jsonl"
             test_path = tmpdir / "test.jsonl"
-            with jsonlines.open(train_path, 'w') as writer:
+            with jsonlines.open(train_path, "w") as writer:
                 train_jl = [asdict(ex) for ex in train_examples]
                 writer.write_all(train_jl)
-            with jsonlines.open(val_path, 'w') as writer:
+            with jsonlines.open(val_path, "w") as writer:
                 val_jl = [asdict(ex) for ex in val_examples]
                 writer.write_all(val_jl)
-            with jsonlines.open(test_path, 'w') as writer:
+            with jsonlines.open(test_path, "w") as writer:
                 test_jl = [asdict(ex) for ex in test_examples]
                 writer.write_all(test_jl)
             mlflow.log_artifact(train_path)
@@ -301,7 +305,7 @@ class CRF:
             mlflow.log_metric("train_count", len(train_examples))
             mlflow.log_metric("val_count", len(val_examples))
             mlflow.log_metric("test_count", len(test_examples))
-        
+
             # train
             tokens = [ex.words for ex in train_examples]
             labels = [ex.labels for ex in train_examples]
@@ -316,32 +320,32 @@ class CRF:
             preds = self.predict(tokens)
             # chunk-wise (seqeval)
             seqeval_report = seqeval_classification_report(
-                golds, preds, digits=4, mode='strict', scheme=BILOU
+                golds, preds, digits=4, mode="strict", scheme=BILOU
             )
             print(seqeval_report)
             metric_df = CRF.convert_report_df(seqeval_report)
-            prf = metric_df.loc['weighted']
-            mlflow.log_metric("weighted-f1-score-chunkwise", prf.loc['f1-score'])
-            mlflow.log_metric("weighted-precision-chunkwise", prf.loc['precision'])
-            mlflow.log_metric("weighted-recall-chunkwise", prf.loc['recall'])
-            prf = metric_df.loc['macro']
-            mlflow.log_metric("macro-f1-score-chunkwise", prf.loc['f1-score'])
-            mlflow.log_metric("macro-precision-chunkwise", prf.loc['precision'])
-            mlflow.log_metric("macro-recall-chunkwise", prf.loc['recall'])
+            prf = metric_df.loc["weighted"]
+            mlflow.log_metric("weighted-f1-score-chunkwise", prf.loc["f1-score"])
+            mlflow.log_metric("weighted-precision-chunkwise", prf.loc["precision"])
+            mlflow.log_metric("weighted-recall-chunkwise", prf.loc["recall"])
+            prf = metric_df.loc["macro"]
+            mlflow.log_metric("macro-f1-score-chunkwise", prf.loc["f1-score"])
+            mlflow.log_metric("macro-precision-chunkwise", prf.loc["precision"])
+            mlflow.log_metric("macro-recall-chunkwise", prf.loc["recall"])
             # tag-wise (sklearn_crfsuite)
             crfsuite_report = crfsuite_metrics.flat_classification_report(
                 golds, preds, labels=sorted_labels, digits=4
             )
             print(crfsuite_report)
             metric_df = CRF.convert_report_df(crfsuite_report)
-            prf = metric_df.loc['weighted']
-            mlflow.log_metric("weighted-f1-score-tagwise", prf.loc['f1-score'])
-            mlflow.log_metric("weighted-precision-tagwise", prf.loc['precision'])
-            mlflow.log_metric("weighted-recall-tagwise", prf.loc['recall'])
-            prf = metric_df.loc['macro']
-            mlflow.log_metric("macro-f1-score-tagwise", prf.loc['f1-score'])
-            mlflow.log_metric("macro-precision-tagwise", prf.loc['precision'])
-            mlflow.log_metric("macro-recall-tagwise", prf.loc['recall'])
+            prf = metric_df.loc["weighted"]
+            mlflow.log_metric("weighted-f1-score-tagwise", prf.loc["f1-score"])
+            mlflow.log_metric("weighted-precision-tagwise", prf.loc["precision"])
+            mlflow.log_metric("weighted-recall-tagwise", prf.loc["recall"])
+            prf = metric_df.loc["macro"]
+            mlflow.log_metric("macro-f1-score-tagwise", prf.loc["f1-score"])
+            mlflow.log_metric("macro-precision-tagwise", prf.loc["precision"])
+            mlflow.log_metric("macro-recall-tagwise", prf.loc["recall"])
 
 
 if __name__ == "__main__":
