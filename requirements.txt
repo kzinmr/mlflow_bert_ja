@@ -7,3 +7,6 @@ requests
 fugashi
 ipadic
 gorilla  # for mlflow
+sklearn_crfsuite
+jsonlines
+jupyter

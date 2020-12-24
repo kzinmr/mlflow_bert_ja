@@ -20,6 +20,7 @@ from seqeval.metrics import (
     recall_score,
 )
 from seqeval.scheme import BILOU
+from sklearn_crfsuite import metrics
 from tokenizers import Encoding
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Dataset
@@ -996,7 +997,8 @@ if __name__ == "__main__":
     best_model.tokenizer.save_pretrained(save_path)
 
     # decode results
-    golds, preds = [], []
+    golds: StrListList = []
+    preds: StrListList = []
     with open(os.path.join(best_model.output_dir, "test_predict.txt"), "wt") as fp:
         id_to_label = dm.label_token_aligner.ids_to_label
         for tokens_batch, golds_batch, preds_batch in best_model.predict(
@@ -1020,6 +1022,11 @@ if __name__ == "__main__":
     recall = recall_score(golds, preds, mode="strict", scheme=BILOU)
     f1 = f1_score(golds, preds, mode="strict", scheme=BILOU)
     print(precision, recall, f1)
+
+    sorted_labels = sorted(set([l for ls in golds for l in ls]))
+    print(metrics.flat_classification_report(
+        golds, preds, labels=sorted_labels, digits=4
+    ))
 
     if args.do_predict:
         # NOTE: load the best checkpoint automatically
