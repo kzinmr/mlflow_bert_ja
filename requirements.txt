@@ -5,8 +5,11 @@ transformers==4.0.1
 seqeval
 requests
 fugashi
+mecab-python3
+regex
 ipadic
 gorilla  # for mlflow
 sklearn_crfsuite
+pytextspan
 jsonlines
 jupyter

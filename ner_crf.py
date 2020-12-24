@@ -158,7 +158,7 @@ def read_examples_from_file(
     return examples
 
 
-class CRF:
+class WordCRF:
     def __init__(self, hparams: Union[Dict, Namespace]):
 
         if isinstance(hparams, Dict):
@@ -182,19 +182,12 @@ class CRF:
         features = {
             "bias": 1.0,
             "word.lower()": word.lower(),
-            "word[-3:]": word[-3:],
-            "word[-2:]": word[-2:],
-            "word.isupper()": word.isupper(),
-            "word.istitle()": word.istitle(),
-            "word.isdigit()": word.isdigit(),
         }
         if i > 0:
             word1 = sent[i - 1][0]
             features.update(
                 {
                     "-1:word.lower()": word1.lower(),
-                    "-1:word.istitle()": word1.istitle(),
-                    "-1:word.isupper()": word1.isupper(),
                 }
             )
         else:
@@ -205,8 +198,6 @@ class CRF:
             features.update(
                 {
                     "+1:word.lower()": word1.lower(),
-                    "+1:word.istitle()": word1.istitle(),
-                    "+1:word.isupper()": word1.isupper(),
                 }
             )
         else:
@@ -277,6 +268,9 @@ class CRF:
         if n_train > 0:
             n_sample = min(n_train, len(train_examples))
             train_examples = random.sample(train_examples, n_sample)
+        tokens = [ex.words for ex in train_examples]
+        print(tokens[:1])
+        print(list(map(self.sentence_features, tokens[:1])))
 
         mlflow.set_tracking_uri(os.environ["MLFLOW_TRACKING_URI"])
         # 使う訓練データの量を徐々に増やす実験を行う
@@ -323,7 +317,7 @@ class CRF:
                 golds, preds, digits=4, mode="strict", scheme=BILOU
             )
             print(seqeval_report)
-            metric_df = CRF.convert_report_df(seqeval_report)
+            metric_df = WordCRF.convert_report_df(seqeval_report)
             prf = metric_df.loc["weighted"]
             mlflow.log_metric("weighted-f1-score-chunkwise", prf.loc["f1-score"])
             mlflow.log_metric("weighted-precision-chunkwise", prf.loc["precision"])
@@ -337,7 +331,7 @@ class CRF:
                 golds, preds, labels=sorted_labels, digits=4
             )
             print(crfsuite_report)
-            metric_df = CRF.convert_report_df(crfsuite_report)
+            metric_df = WordCRF.convert_report_df(crfsuite_report)
             prf = metric_df.loc["weighted"]
             mlflow.log_metric("weighted-f1-score-tagwise", prf.loc["f1-score"])
             mlflow.log_metric("weighted-precision-tagwise", prf.loc["precision"])
@@ -404,5 +398,5 @@ if __name__ == "__main__":
     file_path = os.path.join(args.data_dir, f"train.txt")
     if not os.path.exists(file_path):
         download_dataset(args.data_dir)
-    crf = CRF(args)
+    crf = WordCRF(args)
     crf.do_experiment(args.num_samples)
