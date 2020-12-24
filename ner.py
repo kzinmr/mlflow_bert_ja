@@ -19,8 +19,9 @@ from seqeval.metrics import (
     precision_score,
     recall_score,
 )
+from seqeval.metrics import classification_report as seqeval_classification_report
 from seqeval.scheme import BILOU
-from sklearn_crfsuite import metrics
+from sklearn_crfsuite import metrics as crfsuite_metrics
 from tokenizers import Encoding
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Dataset
@@ -1023,10 +1024,17 @@ if __name__ == "__main__":
     f1 = f1_score(golds, preds, mode="strict", scheme=BILOU)
     print(precision, recall, f1)
 
+    # chunk-wise (seqeval)
+    seqeval_report = seqeval_classification_report(
+        golds, preds, digits=4, mode='strict', scheme=BILOU
+    )
+    print(seqeval_report)
+    # tag-wise (sklearn_crfsuite)
     sorted_labels = sorted(set([l for ls in golds for l in ls]))
-    print(metrics.flat_classification_report(
+    crfsuite_report = crfsuite_metrics.flat_classification_report(
         golds, preds, labels=sorted_labels, digits=4
-    ))
+    )
+    print(crfsuite_report)
 
     if args.do_predict:
         # NOTE: load the best checkpoint automatically
