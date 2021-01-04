@@ -455,8 +455,8 @@ class TokenClassificationDataModule(pl.LightningDataModule):
         self.tokenizer = BertTokenizerFast.from_pretrained(
             self.tokenizer_name,
             cache_dir=self.cache_dir,
-            tokenize_chinese_chars=False,
-            strip_accents=False,
+            # tokenize_chinese_chars=False,  # Need to pretrain tokenzier
+            # strip_accents=False,
         )
         data_dir = Path(self.data_dir)
         if (
@@ -622,8 +622,8 @@ class TokenClassificationModule(pl.LightningModule):
         self.tokenizer = BertTokenizerFast.from_pretrained(
             self.tokenizer_name,
             cache_dir=self.cache_dir,
-            tokenize_chinese_chars=False,
-            strip_accents=False,
+            # tokenize_chinese_chars=False,  # Need to pretrain tokenizer
+            # strip_accents=False,
         )
 
         # AutoConfig
