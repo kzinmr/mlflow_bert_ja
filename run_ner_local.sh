@@ -1,7 +1,8 @@
 # export WORK_DIR=${PWD}
 export PRETRAINED_DIR=${WORK_DIR}/electra_small_wiki40b_ja_mecab_ipadic
-export PRETRAINED_MODEL=${MODEL_DIR}/model_discriminator.pt
-export PRETRAINED_CONFIG=${MODEL_DIR}/config.json
+export PRETRAINED_MODEL=${PRETRAINED_DIR}/model_discriminator.pt
+export PRETRAINED_CONFIG=${PRETRAINED_DIR}/config.json
+export PRETRAINED_TOKENIZER=${PRETRAINED_DIR}/tokenizer.json
 export DATA_DIR=${WORK_DIR}/data/
 export OUTPUT_DIR=${WORK_DIR}/outputs/
 # export CACHE=${WORK_DIR}/cache/
@@ -27,6 +28,7 @@ export NUM_SAMPLES=20000
 python3 ner_electra.py \
 --model_name_or_path=$PRETRAINED_MODEL \
 --config_path=$PRETRAINED_CONFIG \
+--tokenizer_path=$PRETRAINED_TOKENIZER \
 --output_dir=$OUTPUT_DIR \
 --accumulate_grad_batches=1 \
 --max_epochs=$NUM_EPOCHS \
