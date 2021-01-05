@@ -31,6 +31,7 @@ from tokenizers import (
     InputSequence,
     Tokenizer,
 )
+
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Dataset
 from transformers import (
@@ -320,8 +321,9 @@ class LabelTokenAligner:
         return list(map(lambda x: self.labels_to_id.get(x, 0), raw_labels))
 
 
-def load_tokenizer(tokenizer_file: str) -> Tokenizer:
-    """ Load BertWordPieceTokenizer from tokenizer.json. This is necessary due to the following reasons:
+def load_pretrained_tokenizer(tokenizer_file: str, cache_dir: Optional[str] = None) -> PreTrainedTokenizerFast:
+    """ Load BertWordPieceTokenizer from tokenizer.json.
+    This is necessary due to the following reasons:
     - BertWordPieceTokenizer cannot load from tokenizer.json via .from_file() method
     - Tokenizer.from_file(tokenizer_file) cannot be used because MecabPretokenizer is not a valid native PreTokenizer.
     """
@@ -336,7 +338,44 @@ def load_tokenizer(tokenizer_file: str) -> Tokenizer:
             fp.write('\n'.join([w for w, vid in sorted(vocab_map.items(), key=lambda x: x[1])]))
         tokenizer = MecabBertWordPieceTokenizer(vocab_file, **settings)
 
-    return tokenizer
+    tokenizer_dir = os.path.dirname(tokenizer_file)
+    pt_tokenizer: PreTrainedTokenizerFast = AutoTokenizer.from_pretrained(
+        tokenizer_dir,
+        cache_dir=cache_dir,
+    )
+
+    # This is necessary for pt_tokenizer.save_pretrained(save_path)
+    pt_tokenizer._tokenizer = tokenizer._tokenizer
+
+    return pt_tokenizer
+
+
+class PicklableTagger:
+    def __init__(self, mecab_option: str):
+        self.option = mecab_option
+        self.tagger = MeCab.Tagger(mecab_option)
+
+    def __getstate__(self):
+        return {'option': self.option}
+
+    def __setstate__(self, state):
+        for k, v in state.items():
+            setattr(self, k, v)
+
+    def __getnewargs__(self):
+        return self.option,
+
+    def __reduce_ex__(self, proto):
+        func = PicklableTagger
+        args = self.__getnewargs__()
+        state = self.__getstate__()
+        listitems = None
+        dictitems = None
+        rv = (func, args, state, listitems, dictitems)
+        return rv
+
+    def __call__(self, text):
+        return self.tagger.parse(text).rstrip()
 
 
 class MecabPreTokenizer:
@@ -363,7 +402,7 @@ class MecabPreTokenizer:
             if mecab_dict_path is not None
             else "-Owakati"
         )
-        self.mecab = MeCab.Tagger(mecab_option)
+        self.mecab = PicklableTagger(mecab_option)
 
     def __call__(self, text: str):
         return self.pre_tokenize_str(text)
@@ -389,7 +428,7 @@ class MecabPreTokenizer:
         if self.space_replacement:
             text = text.replace(" ", self.space_replacement)
 
-        return self.mecab.parse(text).strip()
+        return self.mecab(text)
 
 
 class MecabBertWordPieceTokenizer(BertWordPieceTokenizer):
@@ -604,21 +643,14 @@ class TokenClassificationDataModule(pl.LightningDataModule):
         self.num_workers = hparams.num_workers
         self.num_samples = hparams.num_samples
         self.labels_path = hparams.labels
-
-        self.tokenizer_dir = os.path.dirname(hparams.model_name_or_path)
-        self.tokenizer_file = os.path.join(self.tokenizer_dir, 'tokenizer.json')
-        assert os.path.exists(self.tokenizer_file)
+        self.tokenizer_file = hparams.tokenizer_path
 
     def prepare_data(self):
         """
         Downloads the data and prepare the tokenizer
         """
 
-        self.tokenizer: PreTrainedTokenizerFast = AutoTokenizer.from_pretrained(
-            self.tokenizer_dir,
-            cache_dir=self.cache_dir,
-        )
-        self.tokenizer._tokenizer = load_tokenizer(self.tokenizer_file)
+        self.tokenizer = load_pretrained_tokenizer(self.tokenizer_file, self.cache_dir)
 
         data_dir = Path(self.data_dir)
         if (
@@ -776,15 +808,9 @@ class TokenClassificationModule(pl.LightningModule):
         self.cache_dir = self.hparams.cache_dir if self.hparams.cache_dir else None
         if self.cache_dir is not None and not os.path.exists(self.hparams.cache_dir):
             os.mkdir(self.cache_dir)
+        self.tokenizer_file = hparams.tokenizer_path
 
-        tokenizer_dir = os.path.dirname(hparams.model_name_or_path)
-        tokenizer_file = os.path.join(tokenizer_dir, 'tokenizer.json')
-        assert os.path.exists(tokenizer_file)
-        self.tokenizer: PreTrainedTokenizerFast = AutoTokenizer.from_pretrained(
-            tokenizer_dir,
-            cache_dir=self.cache_dir,
-        )
-        self.tokenizer._tokenizer = load_tokenizer(tokenizer_file)
+        self.tokenizer = load_pretrained_tokenizer(self.tokenizer_file, self.cache_dir)
 
         config_path = hparams.model_name_or_path if hparams.config_path is None else hparams.config_path
         self.config: PretrainedConfig = AutoConfig.from_pretrained(
@@ -1082,6 +1108,12 @@ if __name__ == "__main__":
         default=None,
         type=str,
         help="Path to pretrained model config",
+    )
+    parser.add_argument(
+        "--tokenizer_path",
+        default=None,
+        type=str,
+        help="Path to pretrained tokenzier JSON config",
     )
     parser.add_argument(
         "--output_dir",
