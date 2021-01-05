@@ -13,7 +13,7 @@ mkdir -p $OUTPUT_DIR
 # `RuntimeError: DataLoader worker is killed by signal: Killed.`
 # Try to reduce NUM_WORKERS or MAX_LENGTH or BATCH_SIZE or increase docker memory
 export NUM_WORKERS=8
-export GPUS=1
+export GPUS=0
 
 export MAX_LENGTH=128
 export BATCH_SIZE=16
@@ -22,10 +22,10 @@ export WEIGHT_DECAY=0.01
 export PATIENCE=3
 export ANNEAL_FACTOR=0.5
 
-export NUM_EPOCHS=30
-export NUM_SAMPLES=20000
+export NUM_EPOCHS=1
+export NUM_SAMPLES=10
 
-python3 ner_electra.py \
+python3 ner_local.py \
 --model_name_or_path=$PRETRAINED_MODEL \
 --config_path=$PRETRAINED_CONFIG \
 --tokenizer_path=$PRETRAINED_TOKENIZER \
