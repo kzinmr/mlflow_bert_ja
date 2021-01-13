@@ -1,7 +1,5 @@
-import json
 import logging
 import os
-import tempfile
 import unicodedata
 from argparse import ArgumentParser, Namespace
 from dataclasses import dataclass
@@ -15,6 +13,7 @@ import mlflow.pytorch
 import numpy as np
 import pytorch_lightning as pl
 import requests
+import textspan
 import torch
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from seqeval.metrics import accuracy_score
@@ -24,29 +23,26 @@ from seqeval.metrics import f1_score, precision_score, recall_score
 from seqeval.scheme import BILOU
 from sklearn_crfsuite import metrics as crfsuite_metrics
 from tokenizers import (
-    AddedToken,
-    BertWordPieceTokenizer,
     Encoding,
-    EncodeInput,
-    InputSequence,
+    NormalizedString,
+    PreTokenizedString,
     Tokenizer,
 )
-
+from tokenizers.pre_tokenizers import PreTokenizer
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Dataset
 from transformers import (
     Adafactor,
     AdamW,
-    BatchEncoding,
     AutoConfig,
     AutoModelForTokenClassification,
     AutoTokenizer,
+    BatchEncoding,
     PretrainedConfig,
     PreTrainedModel,
     PreTrainedTokenizerFast,
 )
 from transformers.modeling_outputs import TokenClassifierOutput
-
 
 # huggingface/tokenizers: Disabling parallelism to avoid deadlocks.
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -321,22 +317,16 @@ class LabelTokenAligner:
         return list(map(lambda x: self.labels_to_id.get(x, 0), raw_labels))
 
 
-def load_pretrained_tokenizer(tokenizer_file: str, cache_dir: Optional[str] = None) -> PreTrainedTokenizerFast:
-    """ Load BertWordPieceTokenizer from tokenizer.json.
+def load_pretrained_tokenizer(
+    tokenizer_file: str, cache_dir: Optional[str] = None
+) -> PreTrainedTokenizerFast:
+    """Load BertWordPieceTokenizer from tokenizer.json.
     This is necessary due to the following reasons:
     - BertWordPieceTokenizer cannot load from tokenizer.json via .from_file() method
     - Tokenizer.from_file(tokenizer_file) cannot be used because MecabPretokenizer is not a valid native PreTokenizer.
     """
-    with open(tokenizer_file) as fp:
-        jd = json.loads(fp.read())
-        settings = jd['normalizer']
-        settings.pop('type')
-        vocab_map = jd['model']['vocab']
-    with tempfile.TemporaryDirectory() as dname:
-        vocab_file = os.path.join(dname, "vocab.txt")
-        with open(vocab_file, 'w') as fp:
-            fp.write('\n'.join([w for w, vid in sorted(vocab_map.items(), key=lambda x: x[1])]))
-        tokenizer = MecabBertWordPieceTokenizer(vocab_file, **settings)
+    tokenizer = Tokenizer.from_file(tokenizer_file)
+    tokenizer.pre_tokenizer = PreTokenizer.custom(MecabPreTokenizer())
 
     tokenizer_dir = os.path.dirname(tokenizer_file)
     pt_tokenizer: PreTrainedTokenizerFast = AutoTokenizer.from_pretrained(
@@ -345,7 +335,7 @@ def load_pretrained_tokenizer(tokenizer_file: str, cache_dir: Optional[str] = No
     )
 
     # This is necessary for pt_tokenizer.save_pretrained(save_path)
-    pt_tokenizer._tokenizer = tokenizer._tokenizer
+    pt_tokenizer._tokenizer = tokenizer  # ._tokenizer
 
     return pt_tokenizer
 
@@ -356,14 +346,14 @@ class PicklableTagger:
         self.tagger = MeCab.Tagger(mecab_option)
 
     def __getstate__(self):
-        return {'option': self.option}
+        return {"option": self.option}
 
     def __setstate__(self, state):
         for k, v in state.items():
             setattr(self, k, v)
 
     def __getnewargs__(self):
-        return self.option,
+        return (self.option,)
 
     def __reduce_ex__(self, proto):
         func = PicklableTagger
@@ -375,16 +365,16 @@ class PicklableTagger:
         return rv
 
     def __call__(self, text):
+        return self.parse(text)
+
+    def parse(self, text):
         return self.tagger.parse(text).rstrip()
 
 
 class MecabPreTokenizer:
-    """ PreTokenizerを継承することはできない """
-
     def __init__(
         self,
         mecab_dict_path: Optional[str] = None,
-        do_lower_case: bool = False,
         space_replacement: Optional[str] = None,
     ):
         """Constructs a MecabPreTokenizer for huggingface tokenizers.
@@ -394,7 +384,6 @@ class MecabPreTokenizer:
             Special characters like '_' are used sometimes.
         """
 
-        self.do_lower_case = do_lower_case
         self.space_replacement = space_replacement
 
         mecab_option = (
@@ -404,105 +393,29 @@ class MecabPreTokenizer:
         )
         self.mecab = PicklableTagger(mecab_option)
 
-    def __call__(self, text: str):
-        return self.pre_tokenize_str(text)
-
-    def pre_tokenize_str(self, sequence: str) -> str:
-        """
-        Pre tokenize the given string
-        This method provides a way to visualize the effect of a
-        :class:`~tokenizers.pre_tokenizers.PreTokenizer` but it does not keep track of the
-        alignment, nor does it provide all the capabilities of the
-        :class:`~tokenizers.PreTokenizedString`. If you need some of these, you can use
-        :meth:`~tokenizers.pre_tokenizers.PreTokenizer.pre_tokenize`
-        Args:
-            sequence (:obj:`str`):
-                A string to pre-tokeize
-        Returns:
-            :obj:`List[Tuple[str, Offsets]]`:
-                A list of tuple with the pre-tokenized parts and their offsets
-        """
+    def tokenize(self, sequence: str) -> List[str]:
         text = unicodedata.normalize("NFKC", sequence)
-        if self.do_lower_case:
-            text = text.lower()
         if self.space_replacement:
             text = text.replace(" ", self.space_replacement)
+            splits = self.mecab.parse(text).strip().split(" ")
+            return [x.replace(self.space_replacement, " ") for x in splits]
+        else:
+            return self.mecab.parse(text).strip().split(" ")
 
-        return self.mecab(text)
+    def custom_split(
+        self, i: int, normalized_string: NormalizedString
+    ) -> List[NormalizedString]:
+        text = str(normalized_string)
+        tokens = self.tokenize(text)
+        tokens_spans = textspan.get_original_spans(tokens, text)
+        return [
+            normalized_string[st:ed]
+            for char_spans in tokens_spans
+            for st, ed in char_spans
+        ]
 
-
-class MecabBertWordPieceTokenizer(BertWordPieceTokenizer):
-    """fast tokenizer"""
-
-    def __init__(
-        self,
-        vocab: Optional[Union[str, Dict[str, int]]] = None,
-        unk_token: Union[str, AddedToken] = "[UNK]",
-        sep_token: Union[str, AddedToken] = "[SEP]",
-        cls_token: Union[str, AddedToken] = "[CLS]",
-        pad_token: Union[str, AddedToken] = "[PAD]",
-        mask_token: Union[str, AddedToken] = "[MASK]",
-        clean_text: bool = True,
-        handle_chinese_chars: bool = False,  # for ja
-        strip_accents: bool = False,  # for ja
-        lowercase: bool = True,
-        wordpieces_prefix: str = "##",
-        mecab_dict_path: Optional[str] = None,
-        space_replacement: Optional[str] = None,
-    ):
-        """vocab: vocab.txt for WordPiece"""
-        super().__init__(
-            vocab=vocab,
-            unk_token=unk_token,
-            sep_token=sep_token,
-            cls_token=cls_token,
-            pad_token=pad_token,
-            mask_token=mask_token,
-            clean_text=clean_text,
-            handle_chinese_chars=handle_chinese_chars,
-            strip_accents=strip_accents,
-            lowercase=lowercase,
-            wordpieces_prefix=wordpieces_prefix,
-        )
-        # from tokenizers.pre_tokenizers import BertPreTokenizer, Sequence
-        # self.pre_tokenizer = Sequence([
-        #     MecabPreTokenizer(
-        #         mecab_dict_path, lowercase, space_replacement
-        #     ),
-        #     BertPreTokenizer()
-        # ])
-        self.mecab_pretok = MecabPreTokenizer(
-            mecab_dict_path, lowercase, space_replacement
-        )
-
-    def encode(
-        self,
-        sequence: InputSequence,
-        pair: Optional[InputSequence] = None,
-        is_pretokenized: bool = False,
-        add_special_tokens: bool = True,
-    ) -> Encoding:
-        if not is_pretokenized:
-            sequence = self.mecab_pretok(sequence)
-        return super().encode(sequence, pair, is_pretokenized, add_special_tokens)
-
-    def encode_batch(
-        self,
-        inputs: List[EncodeInput],
-        is_pretokenized: bool = False,
-        add_special_tokens: bool = True,
-    ) -> List[Encoding]:
-        if not is_pretokenized:
-            # NOTE: reject Tuple[List[str], str] pattern like
-            # ([ "A", "pre", "tokenized", "sequence" ], "And its pair")
-            inputs = [
-                self.mecab_pretok(sequence)
-                if isinstance(sequence, str)
-                else tuple(map(self.mecab_pretok, sequence))
-                for sequence in inputs
-            ]
-
-        return super().encode_batch(inputs, is_pretokenized, add_special_tokens)
+    def pre_tokenize(self, pretok: PreTokenizedString):
+        pretok.split(self.custom_split)
 
 
 class TokenClassificationDataset(Dataset):
@@ -684,6 +597,10 @@ class TokenClassificationDataModule(pl.LightningDataModule):
         self.train_dataset = self.create_dataset(self.train_spandata)
         self.val_dataset = self.create_dataset(self.val_spandata)
         self.test_dataset = self.create_dataset(self.test_spandata)
+        # for ex in self.train_dataset.examples[:10]:
+        #     for w, l in zip(ex.words, ex.labels):
+        #         print(f'{w} \t {l}')
+        #     print()
 
         self.dataset_size = len(self.train_dataset)
 
@@ -812,7 +729,11 @@ class TokenClassificationModule(pl.LightningModule):
 
         self.tokenizer = load_pretrained_tokenizer(self.tokenizer_file, self.cache_dir)
 
-        config_path = hparams.model_name_or_path if hparams.config_path is None else hparams.config_path
+        config_path = (
+            hparams.model_name_or_path
+            if hparams.config_path is None
+            else hparams.config_path
+        )
         self.config: PretrainedConfig = AutoConfig.from_pretrained(
             config_path,
             **({"num_labels": num_labels} if num_labels is not None else {}),

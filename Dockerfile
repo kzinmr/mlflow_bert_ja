@@ -51,4 +51,4 @@ COPY workspace/data/* /app/workspace/
 # COPY config.yaml .
 RUN mkdir -p $WORK_DIR/mlruns
 
-CMD ["bash", "./run_ner.sh"]
+CMD ["bash", "./run_ner_local.sh"]
