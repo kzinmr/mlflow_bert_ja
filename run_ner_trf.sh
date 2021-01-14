@@ -24,9 +24,9 @@ python ner_trf.py \
   --test_file ${DATA_DIR}/test.csv \
   --output_dir ${OUTPUT_DIR} \
   --preprocessing_num_workers ${NUM_WORKERS} \
-  --pad_to_max_length False \
-  --label_all_tokens False \
-  --return_entity_level_metrics True \
+#   --pad_to_max_length \
+#   --label_all_tokens \
+  --return_entity_level_metrics \
   --per_device_train_batch_size=${BATCH_SIZE} \
   --per_device_eval_batch_size=${BATCH_SIZE} \
   --gradient_accumulation_steps=1 \
@@ -36,6 +36,6 @@ python ner_trf.py \
   --num_train_epochs=${NUM_EPOCHS} \
   --lr_scheduler_type="linear" \
   --seed=${SEED} \
-  --load_best_model_at_end=True \
+  --load_best_model_at_end \
   --do_train \
   --do_eval
