@@ -17,7 +17,7 @@ export WEIGHT_DECAY=0.01
 export NUM_EPOCHS=3
 # export NUM_SAMPLES=20000
 
-python run_ner.py \
+python ner_trf.py \
   --model_name_or_path ${BERT_MODEL} \
   --train_file ${DATA_DIR}/train.csv \
   --validation_file ${DATA_DIR}/dev.csv \
@@ -30,7 +30,7 @@ python run_ner.py \
   --per_device_train_batch_size=${BATCH_SIZE} \
   --per_device_eval_batch_size=${BATCH_SIZE} \
   --gradient_accumulation_steps=1 \
-  --learning_rate=${LEARNING_RATE}
+  --learning_rate=${LEARNING_RATE} \
   --weight_decay=${WEIGHT_DECAY} \
   --adam_epsilon=1e-8 \
   --num_train_epochs=${NUM_EPOCHS} \
