@@ -24,8 +24,6 @@ python ner_trf.py \
   --test_file ${DATA_DIR}/test.csv \
   --output_dir ${OUTPUT_DIR} \
   --preprocessing_num_workers ${NUM_WORKERS} \
-#   --pad_to_max_length \
-#   --label_all_tokens \
   --return_entity_level_metrics \
   --per_device_train_batch_size=${BATCH_SIZE} \
   --per_device_eval_batch_size=${BATCH_SIZE} \
@@ -39,3 +37,6 @@ python ner_trf.py \
   --load_best_model_at_end \
   --do_train \
   --do_eval
+
+#   --pad_to_max_length \
+#   --label_all_tokens \
