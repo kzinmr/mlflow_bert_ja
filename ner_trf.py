@@ -209,7 +209,7 @@ def main():
         if data_args.test_file is not None:
             data_files["test"] = data_args.test_file
         extension = data_args.train_file.split(".")[-1]
-        datasets = load_dataset(extension, data_files=data_files, delimiter='\t', quoting=csv.QUOTE_NONE, encoding='utf-8', header=None)   # .tsv
+        datasets = load_dataset(extension, data_files=data_files, delimiter='\t', quoting=csv.QUOTE_NONE, encoding='utf-8')   # .tsv
     # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
     # https://huggingface.co/docs/datasets/loading_datasets.html.
 
@@ -219,6 +219,7 @@ def main():
     else:
         column_names = datasets["validation"].column_names
         features = datasets["validation"].features
+
     text_column_name = "tokens" if "tokens" in column_names else column_names[0]
     label_column_name = (
         f"{data_args.task_name}_tags" if f"{data_args.task_name}_tags" in column_names else column_names[1]
