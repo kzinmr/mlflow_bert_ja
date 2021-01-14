@@ -23,6 +23,7 @@ python ner_trf.py \
   --validation_file ${DATA_DIR}/dev.csv \
   --test_file ${DATA_DIR}/test.csv \
   --output_dir ${OUTPUT_DIR} \
+  --overwrite_output_dir \
   --preprocessing_num_workers ${NUM_WORKERS} \
   --return_entity_level_metrics \
   --per_device_train_batch_size=${BATCH_SIZE} \
