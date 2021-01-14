@@ -32,11 +32,10 @@ python ner_trf.py \
   --weight_decay=${WEIGHT_DECAY} \
   --adam_epsilon=1e-8 \
   --num_train_epochs=${NUM_EPOCHS} \
-  --lr_scheduler_type="linear" \
   --seed=${SEED} \
   --load_best_model_at_end \
   --do_train \
   --do_eval
-
+#   --lr_scheduler_type="linear" \
 #   --pad_to_max_length \
 #   --label_all_tokens \
